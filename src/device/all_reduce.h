@@ -11,14 +11,16 @@
 namespace {
   template<typename T, typename RedOp, typename Proto>
   __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    ncclRing *ring = &ncclShmem.channel.ring;
+    // get the ring topology
+    ncclRing* ring = &ncclShmem.channel.ring;
     int ringIx = ring->index;
     const int nranks = ncclShmem.comm.nRanks;
+    // data block divided here, unit: items
     ssize_t gridOffset;
     ssize_t channelCount;
-    ssize_t chunkCount;
+    ssize_t chunkCount; // number of elements in one chunk, NOTE: it's chunk size
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr, &gridOffset, &channelCount, &chunkCount);
-    const ssize_t loopCount = nranks * chunkCount;
+    const ssize_t loopCount = nranks * chunkCount;  // each loop's all data
     ssize_t offset;
     int nelem;
     int chunk;
@@ -30,7 +32,8 @@ namespace {
       (tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
 
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
-      ssize_t remCount = channelCount - elemOffset;
+      // NOTE: each round will finish a whole chunk of data for reduce-scatter + allgather
+      ssize_t remCount = channelCount - elemOffset;  // level higher than the round level
       ssize_t chunkOffset;
 
       if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nranks), 16/sizeof(T));
@@ -39,19 +42,25 @@ namespace {
         return r - (r >= nranks ? nranks : 0);
       };
 
+      // --- Reduce-Scatter Phase ---
+
       // step 0: push data to next GPU
-      chunk = modRanks(ringIx + nranks - 1);
+      chunk = modRanks(ringIx + nranks - 1);  // the first data chunk
       chunkOffset = chunk * chunkCount;
       offset = gridOffset + elemOffset + chunkOffset;
       nelem = (int)min(chunkCount, remCount - chunkOffset);
       prims.directSend(offset, offset, nelem);
 
+      // INFO: here we found that for different chunks although they are naturally parallelizable but NVIDIA still make them serial, I think it's due to bandwidth and the ease of scheduling.
+
       // k-2 steps: reduce and copy to next GPU
       for (int j = 2; j < nranks; ++j) {
+        // NOTE: here only means different data chunk to send, but not the destination node to be changed
         chunk = modRanks(ringIx + nranks - j);
         chunkOffset = chunk * chunkCount;
         offset = gridOffset + elemOffset + chunkOffset;
         nelem = (int)min(chunkCount, remCount - chunkOffset);
+        // this function should recv from last node, and reduce on local node and then send to the next one.
         prims.directRecvReduceDirectSend(offset, offset, nelem);
       }
 
@@ -61,7 +70,9 @@ namespace {
       chunkOffset = chunk * chunkCount;
       offset = gridOffset + elemOffset + chunkOffset;
       nelem = (int)min(chunkCount, remCount - chunkOffset);
-      prims.directRecvReduceCopyDirectSend(offset, offset, nelem, /*postOp=*/true);
+      prims.directRecvReduceCopyDirectSend(offset, offset, nelem, /*postOp=*/true); // NOTE: here we have a reduce step
+
+      // --- AllGather Phase ---
 
       // k-2 steps: copy to next GPU
       for (int j = 1; j < nranks - 1; ++j) {
