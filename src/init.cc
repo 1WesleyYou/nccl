@@ -503,6 +503,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   int nRanks = comm->nRanks;
   struct ncclKernelCommAndChannels tmpCommAndChans;
   struct ncclKernelCommAndChannels *devCommAndChans = NULL;
+  int* devOptccStragglers = nullptr;
   struct ncclNvmlCCStatus ccStatus;
   bool ccEnable;
   cudaStream_t deviceStream;
@@ -576,10 +577,25 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.comm.collNetDenseToUserRank, comm->collNetDenseToUserRank, nRanks, deviceStream), ret, fail);
   }
 
+  // assign the straggler list to the devOptccStraggler array
+  if (comm->nChannels > 0 && comm->channels[0].optccRing.nStragglers > 0) {
+    int n = comm->channels[0].optccRing.nStragglers;
+    NCCLCHECKGOTO(ncclCudaCallocAsync(&devOptccStragglers, n, deviceStream), ret, fail);
+    ncclCommPushCudaFree(comm, devOptccStragglers);
+    NCCLCHECKGOTO(ncclCudaMemcpyAsync(devOptccStragglers, comm->channels[0].optccRing.stragglerRanks, n, deviceStream), ret, fail);
+  }
+
   for (int c=0; c < MAXCHANNELS; c++) {
     tmpCommAndChans.channels[c].peers = comm->channels[c].devPeers;
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
     tmpCommAndChans.channels[c].ring.userRanks = comm->channels[c].devRingUserRanks;
+    // the tmp var will copy the global channel-local topology to the device side
+    // so here just store the devOptccStragglers (straggler rank list) to tmp var
+    if (c < comm->nChannels) {
+      struct ncclOptccRing* optcc = &tmpCommAndChans.channels[c].optccRing;
+      *optcc = comm->channels[c].optccRing;
+      optcc->stragglerRanks = devOptccStragglers;
+    }
     tmpCommAndChans.channels[c].tree = comm->channels[c].tree;
     tmpCommAndChans.channels[c].collnetChain = comm->channels[c].collnetChain;
     tmpCommAndChans.channels[c].collnetDirect = comm->channels[c].collnetDirect;
@@ -1344,6 +1360,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       NCCLCHECKGOTO(ncclTransportP2pSetup(comm, NULL, 1), ret, fail);
     }
   }
+
+  NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
 
   TRACE(NCCL_INIT, "rank %d nranks %d - CONNECTED %d RINGS AND TREES", rank, nranks, comm->nChannels);
 

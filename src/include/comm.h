@@ -151,6 +151,7 @@ struct ncclChannel {
   /* devPeer pointer array used for host side access */
   struct ncclDevChannelPeer** devPeersHostPtr;
   struct ncclRing ring;
+  struct ncclOptccRing optccRing;
   int* devRingUserRanks;
   struct ncclTree tree;
 

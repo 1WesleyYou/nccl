@@ -181,16 +181,11 @@ struct ncclRing {
 
 
 struct ncclOptccRing {
-  // Bit r marks rank r as a straggler; DIVUP(nRanks, 64) words.
-  const uint64_t* stragglerMask = nullptr;
-
-  // Healthy-ring ranks; -1 when outside the ring.
-  int ringPrev = -1;
-  int ringNext = -1;
-
-  // Bidirectional extra peer ranks; length is nExtraPeers.
-  int nExtraPeers = 0;
-  int* extraPeers = nullptr;
+  int ringPrev; // Local neighbors in the healthy ring; -1 for a straggler.
+  int ringNext;
+  int nHealthyRanks;
+  int nStragglers;
+  int* stragglerRanks;
 };
 
 // The root of each tree only has one node down (+1 intra-node).
@@ -405,6 +400,7 @@ struct ncclDevChannelPeer {
 struct alignas(16) ncclDevChannel {
   struct ncclDevChannelPeer** peers;
   struct ncclRing ring;
+  struct ncclOptccRing optccRing;
   struct ncclTree tree;
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;

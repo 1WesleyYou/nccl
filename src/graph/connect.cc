@@ -10,12 +10,14 @@
 #include "transport.h"
 #include "trees.h"
 #include "rings.h"
+#include "optcc.h"
 #include "topo.h"
 
 /******************************************************************/
 /********************* Internode connection ***********************/
 /******************************************************************/
 
+// preset handles the local topology, namely within one node, we could have multiple gpus (ranks)
 ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs, struct ncclTopoRanks* topoRanks) {
   int rank = comm->rank;
   int localRanks = comm->topo->nodes[GPU].count;
@@ -91,13 +93,91 @@ ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs
   return ncclSuccess;
 }
 
+// directly hardcode the preset for our own topology
+// We have 1 straggler (n2) and 4 healthy nodes (0, 1, 3, 4)
+// So in optcc we will have ring among healthy nodes and point-to-point connection between straggler and all other nodes
+ncclResult_t optccTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs, struct ncclTopoRanks* topoRanks) {
+  int rank = comm->rank;
+  int localRanks = comm->topo->nodes[GPU].count;
+  int nChannels = comm->nChannels;
+
+  topoRanks->crossNicRing = graphs[NCCL_ALGO_RING]->crossNic;
+  topoRanks->nvlsHeadNum = 0;
+  for (int c=0; c<nChannels; c++) {
+    struct ncclChannel* channel = comm->channels+c;
+    channel->ring.prev = channel->ring.next = -1;
+    // channel->tree.up = -1;
+    // channel->collnetChain.up = -1;
+    // for (int i=0; i<NCCL_MAX_TREE_ARITY; i++) channel->tree.down[i] = -1;
+    // for (int i=0; i<NCCL_MAX_TREE_ARITY; i++) channel->collnetChain.down[i] = -1;
+    // channel->collnetDirect.out = -1;
+    // channel->collnetDirect.headRank = -1;
+    // channel->collnetDirect.nHeads = 0;
+    // channel->collnetDirect.shift = 0;
+    // for (int i=0; i<NCCL_MAX_DIRECT_ARITY+1; i++) channel->collnetDirect.heads[i] = -1;
+    // for (int i=0; i<NCCL_MAX_DIRECT_ARITY; i++) channel->collnetDirect.up[i] = -1;
+    // for (int i=0; i<NCCL_MAX_DIRECT_ARITY; i++) channel->collnetDirect.down[i] = -1;
+
+    int* ringIntra = graphs[NCCL_ALGO_RING]->intra+c*localRanks;
+    // int* treeIntra = graphs[NCCL_ALGO_TREE]->intra+c*localRanks;
+    // int* collNetIntra = graphs[NCCL_ALGO_COLLNET_CHAIN]->intra+c*localRanks;
+
+    for (int i=0; i<localRanks; i++) {
+      if (ringIntra[i] == rank) {
+        topoRanks->ringRecv[c] = ringIntra[0];
+        topoRanks->ringSend[c] = ringIntra[localRanks-1];
+        topoRanks->ringPrev[c] = (i == 0) ? -1 : ringIntra[i-1];
+        topoRanks->ringNext[c] = (i == localRanks-1) ? -1 : ringIntra[i+1];
+      }
+      // if (treeIntra[i] == rank) {
+      //   int parentIndex = 0;
+      //   int child0Index = graphs[NCCL_ALGO_TREE]->pattern == NCCL_TOPO_PATTERN_TREE ? 0 : 1;
+      //   int child1Index = graphs[NCCL_ALGO_TREE]->pattern == NCCL_TOPO_PATTERN_SPLIT_TREE ? 1 : 0;
+
+      //   topoRanks->treeToParent[c] = treeIntra[parentIndex];
+      //   topoRanks->treeToChild0[c] = treeIntra[child0Index];
+      //   topoRanks->treeToChild1[c] = treeIntra[child1Index];
+      //   channel->tree.up         = i == 0 ? -1 : treeIntra[i-1];
+      //   channel->tree.down[0]    = i == localRanks-1 ? -1 : treeIntra[i+1];
+      // }
+      // if (collNetIntra[i] == rank) {
+      //   channel->collnetChain.up      = i == 0 ? comm->nRanks : collNetIntra[i-1];
+      //   channel->collnetChain.down[0] = i == localRanks-1 ? -1 : collNetIntra[i+1];
+      // }
+    }
+  }
+  // Duplicate channels trees
+  struct ncclChannel* channel0 = comm->channels;
+  struct ncclChannel* channel1 = channel0+nChannels;
+  memcpy(channel1, channel0, nChannels*sizeof(struct ncclChannel));
+
+  // Get nvls heads and the number of heads. Duplicate head is not allowed.
+  // for (int c = 0; c < graphs[NCCL_ALGO_NVLS]->nChannels; ++c) {
+  //   bool addHead = true;
+  //   int* nvlsIntra = graphs[NCCL_ALGO_NVLS]->intra + c * localRanks;
+
+  //   for (int dup = 0; dup < topoRanks->nvlsHeadNum; dup++) {
+  //     if (topoRanks->nvlsHeads[dup] == nvlsIntra[0]) {
+  //       addHead = false;
+  //       break;
+  //     }
+  //   }
+  //   if (addHead) {
+  //     topoRanks->nvlsHeads[topoRanks->nvlsHeadNum++] = nvlsIntra[0];
+  //   }
+  // }
+  memcpy(comm->nvlsHeads, topoRanks->nvlsHeads, sizeof(int) * topoRanks->nvlsHeadNum);
+
+  return ncclSuccess;
+}
+
 static ncclResult_t connectRings(struct ncclComm* comm, int* ringRecv, int* ringSend, int* ringPrev, int* ringNext) {
   int nChannels = comm->nChannels;
   int nNodes = comm->nNodes;
   for (int c=0; c<nChannels; c++) {
-    int* recv = ringRecv+c*comm->nNodes;
-    int* send = ringSend+c*comm->nNodes;
-    int* prev = ringPrev+c*comm->nRanks;
+    int* recv = ringRecv+c*comm->nNodes;  // each node may contain many gpus
+    int* send = ringSend+c*comm->nNodes;  // and thus all gpus in 1 node share same recv/send
+    int* prev = ringPrev+c*comm->nRanks;  // gpu <-> rank are 1:1
     int* next = ringNext+c*comm->nRanks;
     for (int n=0; n<nNodes; n++) {
       int recvRank = recv[n];
@@ -375,6 +455,9 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   // Gather data from all ranks
   ncclResult_t ret = ncclSuccess;
   int *ringRecv = NULL, *ringSend = NULL, *ringPrev = NULL, *ringNext = NULL, *treeToParent = NULL, *treeToChild0 = NULL, *treeToChild1 = NULL, *nvlsHeads = NULL;
+  int* stragglerRanks = NULL;
+  constexpr int configuredStragglers[] = {2};  // TODO: make this with detection later
+  int nStragglers = 0;
   int nranks = comm->nRanks;
   int nNodes = comm->nNodes;
   int nChannels = comm->nChannels;
@@ -388,6 +471,14 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   NCCLCHECKGOTO(ncclCalloc(&treeToChild0, nNodes*MAXCHANNELS), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&treeToChild1, nNodes*MAXCHANNELS), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&nvlsHeads, nNodes*MAXCHANNELS), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&stragglerRanks, sizeof(configuredStragglers)/sizeof(configuredStragglers[0])), ret, fail);
+  ncclCommPushFree(comm, stragglerRanks);
+  for (int r : configuredStragglers) {
+    if (r < 0 || r >= nranks) continue;
+    bool duplicate = false;
+    for (int i=0; i<nStragglers; i++) if (stragglerRanks[i] == r) duplicate = true;
+    if (!duplicate) stragglerRanks[nStragglers++] = r;
+  }
 
   // Alternate rings to avoid crossing rails.
   // CrossNic values could be not the same on all nodes as it depends on the number of net devs and the NVLink bandwidth.
@@ -506,6 +597,8 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
 
   // Create rings array and check all is fine
   NCCLCHECKGOTO(ncclBuildRings(nChannels, rings, comm->rank, comm->nRanks, ringPrev, ringNext), ret, fail);
+
+  NCCLCHECKGOTO(ncclBuildOptccRings(nChannels, rings, comm, stragglerRanks, nStragglers), ret, fail);
 
 exit:
   if (ringRecv) free(ringRecv);
