@@ -113,6 +113,10 @@ class Primitives<
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
       int spins = 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
+        // a restriction that the consumer should not fall behind producer too much
+        // the connStepCache is the current consumer ptr
+        // the NCCL_STEPS means the window size
+        // the step means (producer_ptr - consumer_ptr)
         connStepCache = loadStepValue(connStepPtr);
         if (checkAbort(flags, Aborted, spins)) break;
         //if (spins == 0) printf("r=%d b=%d t=%d SPUN OUT got=%d want=%d\n", ncclShmem.comm.rank, blockIdx.x, threadIdx.x, int(connStepCache + (isSendNotRecv ? NCCL_STEPS : 0)), int(step+StepPerSlice));
@@ -184,9 +188,9 @@ class Primitives<
   __device__ __forceinline__ void genericOp(
       intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp
     ) {
-    constexpr int DirectRecv = 1 && Direct && DirectRecv1;
-    constexpr int DirectSend = 1 && Direct && DirectSend1;
-    constexpr int Src = SrcBuf != -1;
+    constexpr int DirectRecv = 1 && this->Direct && DirectRecv1;
+    constexpr int DirectSend = 1 && this->Direct && DirectSend1;
+    constexpr int Src = SrcBuf != -1;  // does the data has local src data? like for reduce, usually we have some buffer to store the partial sum
     constexpr int Dst = DstBuf != -1;
 
     nelem = nelem < 0 ? 0 : nelem;
@@ -225,16 +229,20 @@ class Primitives<
       #else
         #pragma unroll 1
       #endif
-      do {
+      do {  // main loop for each worker to process each non-empty slice payload
         sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
         if (tid == 0) {
+          // groups here means all primitive workers that share same state (in one node)
+          // tree allreduce will use groups to divide works between workers in one node, like some add up to the top, and some broadcast to the bottom.
           T* userInput = (T*)ncclShmem.groups[group].userInput;
           T* userOutput = (T*)ncclShmem.groups[group].userOutput;
           if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
           if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
         }
+        // as receiver, wait the upstream to prepare the data slice
+        // after this waitPeer function, the data is already in the local gpu
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
-        subBarrier();
+        subBarrier(); // all workers in the group should wait together for the upstream workers
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
