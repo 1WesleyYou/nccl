@@ -181,7 +181,8 @@ struct ncclRing {
 
 
 struct ncclOptccRing {
-  bool isStraggler = false;
+  // Bit r marks rank r as a straggler; DIVUP(nRanks, 64) words.
+  const uint64_t* stragglerMask = nullptr;
 
   // Healthy-ring ranks; -1 when outside the ring.
   int ringPrev = -1;
