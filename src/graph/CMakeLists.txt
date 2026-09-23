@@ -7,6 +7,7 @@ set(GRAPH_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/paths.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/connect.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/rings.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/optcc.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/trees.cc
 )
 

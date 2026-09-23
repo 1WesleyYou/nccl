@@ -1,0 +1,20 @@
+{
+  "clang-format.executable": "/usr/bin/clang-format-22",
+  "clang-format.style": "file",
+  "clang-format.fallbackStyle": "none",
+  "[cpp]": {
+    "editor.defaultFormatter": "xaver.clang-format",
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "modificationsIfAvailable"
+  },
+  "[c]": {
+    "editor.defaultFormatter": "xaver.clang-format",
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "modificationsIfAvailable"
+  },
+  "[cuda]": {
+    "editor.defaultFormatter": "xaver.clang-format",
+    "editor.formatOnSave": true,
+    "editor.formatOnSaveMode": "modificationsIfAvailable"
+  }
+}

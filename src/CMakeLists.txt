@@ -81,7 +81,6 @@ add_custom_command(
                 -e "s/\\\$$\\{nccl:Suffix\\}/${NCCL_SUFFIX}/g"
                 -e "s/\\\$$\\{nccl:Version\\}/${NCCL_VERSION_CODE}/g"
                 ${CMAKE_CURRENT_SOURCE_DIR}/nccl.h.in > ${CMAKE_BINARY_DIR}/include/nccl.h
-    BYPRODUCTS ${CMAKE_BINARY_DIR}/include/nccl.h
 )
 
 file(GLOB_RECURSE SRC_DEVICE_HEADERS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include/nccl_device/*.h)
