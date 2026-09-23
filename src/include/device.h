@@ -180,8 +180,6 @@ struct ncclRing {
 };
 
 
-#define NCCL_OPTCC_MAX_EXTRA_PEERS 256
-
 struct ncclOptccRing {
   bool isStraggler = false;
 
@@ -189,9 +187,9 @@ struct ncclOptccRing {
   int ringPrev = -1;
   int ringNext = -1;
 
-  // Bidirectional extra peers (ranks); only [0, nExtraPeers) is valid.
+  // Bidirectional extra peer ranks; length is nExtraPeers.
   int nExtraPeers = 0;
-  int extraPeers[NCCL_OPTCC_MAX_EXTRA_PEERS] = {};
+  int* extraPeers = nullptr;
 };
 
 // The root of each tree only has one node down (+1 intra-node).
