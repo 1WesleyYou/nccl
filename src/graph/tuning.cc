@@ -144,26 +144,30 @@ static const ncclTunerConstants_t ncclTunerConstantsDefaults = {
     {  6.8, 14.0,  8.4 }, {  6.6, 14.0,  8.4 },  // Tree, Ring
     {    0,    0,    0 }, {    0,    0,    0 },  // Collnet Direct, Chain
     {    0,    0,    0 }, {    0,    0,    0 },  // NVLS, NVLS Tree
-    {  8.0,  8.0,  8.0 }                         // PAT
+    {  8.0,  8.0,  8.0 },                        // PAT
+    {    0,    0,    0 }                         // OPTCCRING (not modeled yet)
     },
   .hwLatencies = {
   /* NVLINK */
   { { .6, 1.25, 4.0 }, { .6, 1.9, 3.4 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {  0,    0,  25 }, {  0,   0,  25 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
+    {  0,    0, 4.0 }, /* PAT (LL/LL128/Simple)*/
+    {  0,    0,   0 }  /* OPTCCRING */
     },
   /* PCI */
   { { 1.0, 1.9, 4.0 }, { 1.0, 2.5, 5.7 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {  0,    0,   0 }, {  0,   0,    0 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
+    {  0,    0, 4.0 }, /* PAT (LL/LL128/Simple)*/
+    {  0,    0,   0 }  /* OPTCCRING */
     },
   /* NET */
   { { 5.0, 8.5, 14 }, { 2.7, 4.0, 14.0 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {   0,   0, 31 }, {   0,   0,   30 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {   0,   0, 18 }, {   0,   0,   14 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {   0,   0, 14 } /* PAT (LL/LL128/Simple)*/
+    {   0,   0, 14 }, /* PAT (LL/LL128/Simple)*/
+    {   0,   0,  0 }  /* OPTCCRING */
     },
   },
   .llMaxBws = {
@@ -270,6 +274,8 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
       nRanks;
 
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+      // TODO: add cost model for optccring.
+      if (a == NCCL_ALGO_OPTCCRING) continue; // Keep zero-initialized costs until kernel/proxy support exists.
       if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
       if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
           && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
@@ -461,7 +467,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
 
   for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
-      int disable = 0;
+      int disable = a == NCCL_ALGO_OPTCCRING;
       // Disable NVLS Tree on a single node
       if (comm->nNodes == 1 && a == NCCL_ALGO_NVLS_TREE) disable = 1;
       // Disable Collnet+Direct, Collnet+Chain or Collnet+NVLS if collnet is not supported.

@@ -27,7 +27,7 @@ typedef enum {
   ncclNumFuncs = 8
 } ncclFunc_t;
 
-#define NCCL_NUM_ALGORITHMS 7 // Tree/Ring/CollNet*
+#define NCCL_NUM_ALGORITHMS 8 // Tree/Ring/CollNet*/NVLS*/PAT/OPTCCRING
 #define NCCL_ALGO_UNDEF -1
 #define NCCL_ALGO_TREE 0
 #define NCCL_ALGO_RING 1
@@ -36,6 +36,7 @@ typedef enum {
 #define NCCL_ALGO_NVLS 4
 #define NCCL_ALGO_NVLS_TREE 5
 #define NCCL_ALGO_PAT 6
+#define NCCL_ALGO_OPTCCRING 7
 
 #define NCCL_NUM_PROTOCOLS 3 // Simple/LL/LL128
 #define NCCL_PROTO_UNDEF -1
@@ -75,10 +76,12 @@ typedef struct {
   double perChMaxRingLL128Bws [NCCL_NUM_COMPCAPS][NCCL_NUM_TUNING_SCALES];
   double perChMaxTreeLL128Bws [NCCL_NUM_COMPCAPS][NCCL_NUM_TUNING_SCALES];
   double perChMaxTreeBws [NCCL_NUM_COMPCAPS][NCCL_NUM_TUNING_SCALES];
+  double perChMaxNVLSTreeBws [NCCL_NUM_COMPCAPS][NCCL_NUM_TUNING_SCALES];
 
 
 } ncclTunerConstants_v5_t;
 
+// OptCC extends v5 constants to eight algorithms; rebuild plugins with this header.
 // API to be implemented by external tuner
 typedef struct {
   // Name of the tuner

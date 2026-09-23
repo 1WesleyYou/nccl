@@ -15,7 +15,7 @@ typedef struct {
   int maxRanksPerNvlDomain;           // maximum ranks across all NVLink domains
 } ncclNvlDomainInfo_v5_t;
 
-#define NCCL_NUM_ALGORITHMS_V5 7 // Tree/Ring/CollNet*/PAT
+#define NCCL_NUM_ALGORITHMS_V5 8 // Tree/Ring/CollNet*/NVLS*/PAT/OPTCCRING
 #define NCCL_NUM_PROTOCOLS_V5 3 // Simple/LL/LL128
 #define NCCL_NUM_HW_LINKS_V5 3
 #define NCCL_NUM_COMPCAPS_V5 4
@@ -34,6 +34,7 @@ typedef struct {
 
 } ncclTunerConstants_v5_t;
 
+// OptCC extends v5 constants to eight algorithms; rebuild plugins with this header.
 // API to be implemented by external tuner
 typedef struct {
   // Name of the tuner

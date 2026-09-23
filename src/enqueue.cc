@@ -1829,6 +1829,8 @@ static ncclResult_t topoGetAlgoInfo(
   int algorithm = info->algorithm = NCCL_ALGO_UNDEF;
   int protocol = info->protocol = NCCL_PROTO_UNDEF;
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+    // TODO: add cost model for the optccring
+    if (a == NCCL_ALGO_OPTCCRING) continue; // Guard tuner overrides until kernel/proxy dispatch exists.
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (table[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
       if (table[a][p] >= 0.0 && table[a][p] < minTime) {

@@ -149,6 +149,10 @@ static ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConn
           NCCLCHECK(ncclTransportRingConnect(comm));
           break;
         }
+        case NCCL_ALGO_OPTCCRING: {
+          NCCLCHECK(ncclTransportOptccConnect(comm));
+          break;
+        }
         case NCCL_ALGO_TREE: {
           NCCLCHECK(ncclTransportTreeConnect(comm));
           break;

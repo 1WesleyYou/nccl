@@ -23,7 +23,7 @@ ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs
   int localRanks = comm->topo->nodes[GPU].count;
   int nChannels = comm->nChannels;
 
-  topoRanks->crossNicRing = graphs[NCCL_ALGO_RING]->crossNic;
+  topoRanks->crossNicRing = graphs[NCCL_ALGO_RING]->crossNic;  // TODO: here we have no-intra hypothesis
   topoRanks->nvlsHeadNum = 0;
   for (int c=0; c<nChannels; c++) {
     struct ncclChannel* channel = comm->channels+c;
