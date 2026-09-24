@@ -404,9 +404,6 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->destructorHead = nullptr;
   comm->rank = rank;
   comm->nRanks = ndev;
-  // Initialize once; later algorithm connections must preserve accumulated NET capabilities.
-  comm->useGdr = parent && parent->shareResources ? parent->useGdr : true;
-  comm->useNetPXN = parent && parent->shareResources ? parent->useNetPXN : false;
 
   if (parent == NULL || !parent->shareResources) {
     struct ncclSharedResources* sharedRes = NULL;
@@ -1327,6 +1324,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       }
     }
 
+    // Connect OptCC last so every upstream algorithm builds its shared slots with its own graph.
+    NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
+
     // Connect to local net proxy
     NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, comm->rank, &proxyConn), ret, fail);
     NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
@@ -1368,8 +1368,6 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       NCCLCHECKGOTO(ncclTransportP2pSetup(comm, NULL, 1), ret, fail);
     }
   }
-
-  NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
 
   TRACE(NCCL_INIT, "rank %d nranks %d - CONNECTED %d RINGS AND TREES", rank, nranks, comm->nChannels);
 

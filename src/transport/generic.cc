@@ -16,6 +16,8 @@ ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
   struct ringConnInfo* ringInfo = NULL;
   ncclResult_t ret = ncclSuccess;
   if (comm && comm->nRanks > 1) {
+    comm->useGdr = true;
+    comm->useNetPXN = false;
     for (int c = 0; c < comm->nChannels; c++) {
       struct ncclChannel* channel = comm->channels + c;
       NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &channel->ring.prev, 1, &channel->ring.next, 0), ret, fail);
@@ -80,8 +82,9 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
     }
   }
 
-  // OptCC adds peers outside the original ring graph; choose NET routes per peer.
-  NCCLCHECKGOTO(ncclTransportP2pSetup(comm, NULL, 0), ret, fail);
+  // The graph picks a NIC per channel, not per peer, so extra OptCC edges use the ring's NICs.
+  NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_OPTCCRING], 0), ret, fail);
+  // Unlike the ring, do not reset useGdr/useNetPXN: slots other algorithms already built are skipped above.
   if (ncclParamLocalRegister() || ncclParamGraphRegister()) {  // software config read
     NCCLCHECK(ncclCalloc(&optccInfo, comm->nRanks));
     optccInfo[comm->rank].useGdr = comm->useGdr;
