@@ -188,8 +188,8 @@ class Primitives<
   __device__ __forceinline__ void genericOp(
       intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp
     ) {
-    constexpr int DirectRecv = 1 && this->Direct && DirectRecv1;
-    constexpr int DirectSend = 1 && this->Direct && DirectSend1;
+    constexpr int DirectRecv = 1 && Direct && DirectRecv1;
+    constexpr int DirectSend = 1 && Direct && DirectSend1;
     constexpr int Src = SrcBuf != -1;  // does the data has local src data? like for reduce, usually we have some buffer to store the partial sum
     constexpr int Dst = DstBuf != -1;
 
