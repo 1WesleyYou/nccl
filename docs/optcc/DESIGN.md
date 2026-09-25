@@ -73,3 +73,47 @@ the error vanishes (the measured +1%). Fix: remember the posted size per step
 slot (`recvNetResources::rxPosted`) and refund posted - received when the step
 completes. The cap now counts bytes received. 1a is kept: it is still right
 that waiting for tokens is not idleness.
+
+## 2. OptccRing AllReduce kernel (l >= 2 schedule, one straggler)
+
+Branch `optcc-kernel` (on top of `optcc-rxlimit`).
+
+**Use.**
+- `NCCL_ALGO=allreduce:OptccRing` turns it on, and `NCCL_OPTCC_STRAGGLER=<rank>` names the straggler (default 2, the old hard-coded value).
+- Without that, nothing changes:
+  - `ncclOptccRequested()` is false;
+  - the algorithm stays disabled and has no cost;
+  - the eager `ncclTransportOptccConnect` is skipped.
+
+**Device (`src/device/all_reduce_optcc.h`, new).**
+- `RunWorkColl<AllReduce, OPTCCRING, SIMPLE>`.
+- **Segments:** a channel's loop is one segment of nh = p-1 sections, and healthy index i owns section i.
+- **Two orderings, by channel parity:**
+  - Even channels run S1 S2 S3 S4: `send`/`recvReduceSend`/`recvReduceCopy` over the healthy ring, then `sendFromOutput` + `recv` with the straggler, then the ring allgather.
+  - Odd channels run S3 S1 S4 S2. The straggler sends raw section j to the rank that starts j's chain (healthy index j+1), which takes it with `recvReduceSend` on its first hop. The owner ends reduce-scatter with the global sum, allgathers it, and sends it back last.
+- **Stages as scoped primitives:** each stage is its own `Primitives<..., FanAsymmetric<1,1>, ...>` in a scope.
+  - The destructor writes the connection step back, so stages chain on the connections the OptCC connect built.
+  - FanAsymmetric, because the straggler's send-only and recv-only stages pass -1. `FanSymmetric` stores the recv count for both sides and would silently drop the send.
+- **Concurrency:** channels run concurrently, which is where the ring of one channel overlaps the straggler link of another. The channel count plays the role of the paper's pattern count.
+
+**Host.**
+- `device.h`: `ncclOptccRing` gains `straggler`, `healthyIndex` and a fixed `healthy[8]`. The healthy order is canonical (the channel ring rotated to its lowest rank, stragglers skipped), so every rank agrees on which rank owns which section.
+- `optcc.cc`: fills those fields; defines `ncclOptccRequested()` (NCCL_ALGO names it, not as a `^` exclusion) and `NCCL_OPTCC_STRAGGLER`.
+- `tuning.cc`: when requested, AllReduce/Simple takes the ring's bandwidth and latency as a placeholder cost; otherwise the algorithm is disabled as before.
+- `enqueue.cc`:
+  - selection guard only when not requested;
+  - `ncclPatternOptcc` with `nstepsPerLoop = 1`, `nchunksPerLoop = p-1`;
+  - the ring's chunk/slice steps and the extra sync warp.
+- `proxy.cc`: `ncclPatternOptcc` scales `nsteps` per connection:
+  - healthy: 2(nh-1) to next / from prev, 1 to / 1 from the straggler;
+  - straggler: 1 each way per healthy rank.
+  - This is the part that hangs if it disagrees with the kernel.
+- `device.h ncclDevFuncId` + `generate.py`: AllReduce gets a 7th algorithm slot (OPTCCRING is id 7; PAT = 6 is not an AllReduce algorithm). `generate.py` already builds only SIMPLE for non-ring/tree algorithms.
+
+**Checks done (2026-09-24, 5-container rig).**
+- `Connected optcc rings` on all 5 ranks, i.e. the algorithm was selected.
+- `ring_allreduce.cpp` exact at 1-64 MiB, l = 1 and 2.
+- nccl-tests `all_reduce_perf -c 1`, 1-64 MiB at l = 2 with RX caps: 0 wrong in two runs.
+- **Open:** one earlier nccl-tests run hung at its first size (1 MiB) and was not reproduced in the next three runs. The campaign retries that gate once and times out single runs.
+
+**Not done.** l < 2 bubble filling; a real cost model; more than one straggler; LL/LL128.
