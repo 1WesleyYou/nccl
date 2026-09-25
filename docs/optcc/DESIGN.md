@@ -213,3 +213,37 @@ and `USER_PROGRAMMABLE_CC=False`.
 Path, if wanted: `mstconfig set ROCE_CC_LEGACY_DCQCN=1` on both BF2s plus a
 portal power cycle, then a controller in the straggler's host that meters its
 VF's RX and sends CNPs. That is not doable unattended; the credit gate stays.
+
+## 5. Segment pipelining inside a channel (branch `optcc-skew`)
+
+**Problem.** A channel ran its segments strictly one after another:
+- a healthy rank could not start segment L+1's reduce-scatter until segment L's allgather had finished;
+- that allgather itself waited for the straggler's answer.
+
+With few, large segments the straggler link idles for about one segment per
+loop. This is the paper's (k+1)/k head and tail repeated on every segment
+instead of once per collective. Fixed-k runs (Task 3, `NCCL_BUFFSIZE = n/(2k)`)
+showed it: k = 8 on 4 channels took 66 ms at 64 MiB, 1.45x the straggler's
+link bound, where the paper's schedule gives 1.125x.
+
+**Change.** Each segment is split where it waits on the other side of the
+straggler link:
+
+| Role, ordering | front(L) | back(L) |
+|---|---|---|
+| healthy, 1 | RS + send partial to S | recv sum from S + AG |
+| healthy, 2 | fold S's raw section + RS | AG + send sum to S |
+| straggler, 1 | the fused `recvReduceCopySend` per section | nothing |
+| straggler, 2 | send raw sections | recv sums |
+
+The issue order is `front(0); for L>=1: front(L), back(L-1); back(last)`. This
+is the paper's composite schedule, in which one segment's straggler exchange
+hides behind the next segment's healthy-ring work.
+
+**Why it is safe.**
+- Every rank issues the same sequence, so each connection still carries one fixed order of chunks. The ring, for example, sees A(0) A(1) D(0) A(2) D(1) ...
+- Per-connection step counts are unchanged: the healthy ordering-1 link stage becomes a send-only and a recv-only primitive, same steps.
+- At most 2 chunks are ever outstanding on a connection, which is its FIFO:
+  - The straggler sends raw(L+1) only after all sums of L-1 arrived, and every starter consumed raw(L) before sending them.
+  - A healthy rank sends partial(L+1) only after the straggler answered L-1.
+- Off switch: `optcc-kernel` without this commit.
