@@ -117,3 +117,32 @@ Branch `optcc-kernel` (on top of `optcc-rxlimit`).
 - **Open:** one earlier nccl-tests run hung at its first size (1 MiB) and was not reproduced in the next three runs. The campaign retries that gate once and times out single runs.
 
 **Not done.** l < 2 bubble filling; a real cost model; more than one straggler; LL/LL128.
+
+## 3. Why OptccRing missed the bound, and the fix: finer segments
+
+**Symptom.** With default buffers (NCCL_BUFFSIZE 4 MiB), the l = 2 slope was 1.468 x beta_1 at 4 channels (bound 1.25), and l = 1 was 1.317 (fluid ideal 1.094 = 1.75n / 1.6n: each healthy NIC sends RS 0.75n + AG 0.75n + upload 0.25n).
+
+**Cause: stage serialisation inside a channel.**
+- A section is one NCCL chunk (Simple: stepSize 512 KiB x chunkSteps 4 = 2 MiB), and a channel runs RS -> straggler link -> AG of a segment strictly in order.
+- Ordering-1 channels leave the ring idle while the straggler serves four uploads in turn.
+- Ordering-2 channels use the straggler link one direction at a time: sends first, receives later.
+- With t = one healthy-NIC section time and l = 2, a segment costs about 14t (ordering 1) and 22t (ordering 2) against the ideal 8t. That model predicts 1.72 for 2 channels; measured 1.745.
+- Other channels can hide these bubbles only if segments are short relative to the collective. With 2 MiB sections, a channel has just 8 segments at 256 MiB.
+
+**Fix: `NCCL_BUFFSIZE=524288`.**
+- Chunks are 256 KiB and there are 8x more segments per channel. The kernel does not change.
+- Measured (8-256 MiB, 3 rounds, 2026-09-25, `results/20260925_optcc_kernel_b512`):
+  - l = 2, 4 channels: **1.279 [1.268, 1.291]**, 2.3% above the bound. 256 MiB: 187.7 ms vs ring 293.9 ms (bound 184.1 ms).
+  - l = 1, 4 channels: **1.096**, the fluid ideal.
+  - Ring with the same buffer: 0.998 (l = 1) and 2.009 (l = 2), i.e. unchanged. The comparison stays fair.
+- Search at 128/256 MiB, l = 2: 2 MiB -> 1 MiB -> 512 KiB buffers improve monotonically, and 4-12 channels are all within noise at 512 KiB. Smaller buffers were not tried.
+
+**Possible follow-up.**
+- Give OptccRing its own smaller chunk in `calcCollChunking` instead of a comm-wide buffer size, so the ring keeps its default. Not done: the buffer knob already leaves the ring unchanged here, and a code default needs the same validation again.
+- Overlap the next segment's ring stage with the current straggler stage inside one channel (split the block into two thread groups), the structural version of the same fix.
+
+**Open: intermittent hang.**
+- About 4% of OptccRing runs (5 of ~120 on 2026-09-24/25) hang in their first collective. It has hit both l, both buffer sizes, 1-64 MiB, with and without the RX cap, with and without a fresh VF re-cap.
+- The one proxy dump taken (collective sub progress was not printed then) showed every connection's first collective still active on all ranks.
+- `24c42d79` makes the dump print posted/received/transmitted/done/nsteps per sub; `diag.sh hunt2` is catching one, and also A/B-tests eager connect (NCCL_RUNTIME_CONNECT=0).
+- Campaigns survive it: run timeout, rig rebuild (a killed hung run breaks MPS), and refill.
