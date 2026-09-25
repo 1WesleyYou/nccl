@@ -1,5 +1,23 @@
 #include "optcc.h"
 #include "comm.h"
+#include "param.h"
+#include <cctype>
+#include <cstring>
+#include <string>
+
+NCCL_PARAM(OptccStraggler, "OPTCC_STRAGGLER", 2);
+int ncclOptccStraggler() { return (int)ncclParamOptccStraggler(); }
+
+bool ncclOptccRequested() {
+  static int requested = -1;
+  if (requested < 0) {
+    const char* env = ncclGetEnv("NCCL_ALGO");
+    std::string s = env ? env : "";
+    for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+    requested = (!s.empty() && s[0] != '^' && s.find("optccring") != std::string::npos) ? 1 : 0;
+  }
+  return requested == 1;
+}
 
 static bool isStraggler(const int* ranks, int count, int rank) {
   for (int i=0; i<count; i++) if (ranks[i] == rank) return true;
@@ -19,6 +37,23 @@ ncclResult_t ncclBuildOptccRings(int nChannels, const int* rings, struct ncclCom
     optcc->nStragglers = nStragglers;
     optcc->stragglerRanks = stragglerRanks;
     optcc->ringPrev = optcc->ringNext = -1;
+    optcc->straggler = nStragglers > 0 ? stragglerRanks[0] : -1;
+    optcc->healthyIndex = -1;
+    {
+      // Canonical healthy order: this channel's ring, rotated to start at its lowest rank.
+      const int* ord = rings+c*nranks;
+      int start = 0;
+      for (int i=1; i<nranks; i++) if (ord[i] < ord[start]) start = i;
+      int n = 0;
+      for (int i=0; i<nranks; i++) {
+        int r = ord[(start+i)%nranks];
+        if (isStraggler(stragglerRanks, nStragglers, r)) continue;
+        if (n < NCCL_OPTCC_MAX_HEALTHY) optcc->healthy[n] = r;
+        if (r == comm->rank) optcc->healthyIndex = n;
+        n++;
+      }
+      if (n > NCCL_OPTCC_MAX_HEALTHY) return ncclInvalidUsage;
+    }
 
     // A straggler is outside the healthy ring.
     if (localIsStraggler) continue;

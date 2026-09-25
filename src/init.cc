@@ -15,6 +15,7 @@
 #include "coll_net.h"
 #include "enqueue.h"
 #include "graph.h"
+#include "graph/optcc.h"
 #include "argcheck.h"
 #include "tuner.h"
 #include "ras.h"
@@ -1325,7 +1326,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
 
     // Connect OptCC last so every upstream algorithm builds its shared slots with its own graph.
-    NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
+    if (ncclOptccRequested()) NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
 
     // Connect to local net proxy
     NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, comm->rank, &proxyConn), ret, fail);

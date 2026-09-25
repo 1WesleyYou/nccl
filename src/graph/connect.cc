@@ -378,7 +378,7 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   ncclResult_t ret = ncclSuccess;
   int *ringRecv = NULL, *ringSend = NULL, *ringPrev = NULL, *ringNext = NULL, *treeToParent = NULL, *treeToChild0 = NULL, *treeToChild1 = NULL, *nvlsHeads = NULL;
   int* stragglerRanks = NULL;
-  constexpr int configuredStragglers[] = {2};  // TODO: make this with detection later
+  const int configuredStragglers[] = {ncclOptccStraggler()};  // TODO: make this with detection later
   int nStragglers = 0;
   int nranks = comm->nRanks;
   int nNodes = comm->nNodes;

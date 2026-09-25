@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "enqueue.h"
+#include "graph/optcc.h"
 #include "argcheck.h"
 #include "coll_net.h"
 #include "gdrwrap.h"
@@ -1830,7 +1831,7 @@ static ncclResult_t topoGetAlgoInfo(
   int protocol = info->protocol = NCCL_PROTO_UNDEF;
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
     // TODO: add cost model for the optccring
-    if (a == NCCL_ALGO_OPTCCRING) continue; // Guard tuner overrides until kernel/proxy dispatch exists.
+    if (a == NCCL_ALGO_OPTCCRING && !ncclOptccRequested()) continue; // only when NCCL_ALGO names it
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
       if (table[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
       if (table[a][p] >= 0.0 && table[a][p] < minTime) {
@@ -1901,7 +1902,7 @@ static ncclResult_t topoGetAlgoInfo(
     }
   }
   if (info->protocol == NCCL_PROTO_SIMPLE) {
-    if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
+    if (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_OPTCCRING) nt += WARP_SIZE; // Extra warp for sync
     // More threads or sync warps needed due to split thread model
     if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
   }
@@ -2013,6 +2014,7 @@ static ncclResult_t calcCollChunking(
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
       info->algorithm == NCCL_ALGO_COLLNET_CHAIN ? ncclPatternCollnetChain :
       info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUpDown :
+      info->algorithm == NCCL_ALGO_OPTCCRING ? ncclPatternOptcc :
       ncclPatternRingTwice;
     break;
   default:
@@ -2023,8 +2025,9 @@ static ncclResult_t calcCollChunking(
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
   int stepSize   = comm->buffSizes[info->protocol]/NCCL_STEPS;
-  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
-  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  const bool ringSteps = info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_OPTCCRING;  // same ProtoSimple
+  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && ringSteps) ? info->chunkSteps : 1;
+  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && ringSteps) ? info->sliceSteps : 1;
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
@@ -2117,6 +2120,11 @@ static ncclResult_t calcCollChunking(
     break;
   case ncclPatternRingTwice:
     nstepsPerLoop = 2*(comm->nRanks-1); nchunksPerLoop = comm->nRanks;
+    break;
+  case ncclPatternOptcc:
+    // One segment = p-1 sections per loop. nsteps counts one section; the
+    // proxy scales it per connection (ncclProxySaveOp).
+    nstepsPerLoop = 1; nchunksPerLoop = comm->nRanks-1;
     break;
   case ncclPatternNvlsTree:
     nstepsPerLoop = 1; nchunksPerLoop = comm->channels[0].nvls.nHeads;
@@ -2219,6 +2227,7 @@ static ncclResult_t calcCollChunking(
   case ncclPatternPipelineTo:
   case ncclPatternPatUp:
   case ncclPatternPatDown:
+  case ncclPatternOptcc:
     proxyOp->nPeers = 1;
     break;
   case ncclPatternTreeUp:

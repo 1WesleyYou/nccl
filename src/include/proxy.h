@@ -35,6 +35,7 @@ typedef enum : uint8_t {
   ncclPatternSend,
   ncclPatternRecv,
   ncclPatternProfiler,
+  ncclPatternOptcc,
 } ncclPattern_t;
 
 enum ncclProxyOpState { ncclProxyOpNone, ncclProxyOpReady, ncclProxyOpProgress };

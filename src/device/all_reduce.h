@@ -789,3 +789,5 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_TREE, NCCL_PROTO_LL128
     runTreeSplit<T, RedOp, ProtoLL128>(tid, nthreads, work);
   }
 };
+
+#include "all_reduce_optcc.h"

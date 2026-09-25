@@ -7,6 +7,7 @@
 #include "core.h"
 #include "device.h"
 #include "comm.h"
+#include "optcc.h"
 #include "topo.h"
 #include "nccl_tuner.h"
 
@@ -274,8 +275,15 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
       nRanks;
 
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
-      // TODO: add cost model for optccring.
-      if (a == NCCL_ALGO_OPTCCRING) continue; // Keep zero-initialized costs until kernel/proxy support exists.
+      // TODO: add cost model for optccring. Until then, when NCCL_ALGO names it,
+      // AllReduce/Simple borrows the ring's cost (computed above) so it can be picked.
+      if (a == NCCL_ALGO_OPTCCRING) {
+        if (coll == ncclFuncAllReduce && ncclOptccRequested()) {
+          comm->bandwidths[coll][a][NCCL_PROTO_SIMPLE] = comm->bandwidths[coll][NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
+          comm->latencies[coll][a][NCCL_PROTO_SIMPLE] = comm->latencies[coll][NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
+        }
+        continue;
+      }
       if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
       if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
           && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
@@ -467,7 +475,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
 
   for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
-      int disable = a == NCCL_ALGO_OPTCCRING;
+      int disable = a == NCCL_ALGO_OPTCCRING && !ncclOptccRequested();
       // Disable NVLS Tree on a single node
       if (comm->nNodes == 1 && a == NCCL_ALGO_NVLS_TREE) disable = 1;
       // Disable Collnet+Direct, Collnet+Chain or Collnet+NVLS if collnet is not supported.

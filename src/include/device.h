@@ -180,12 +180,20 @@ struct ncclRing {
 };
 
 
+#define NCCL_OPTCC_MAX_HEALTHY 8
 struct ncclOptccRing {
   int ringPrev; // Local neighbors in the healthy ring; -1 for a straggler.
   int ringNext;
   int nHealthyRanks;
   int nStragglers;
   int* stragglerRanks;
+  // Kernel schedule (one straggler). healthy[] is the healthy ring in the same
+  // order on every rank (channel ring order, rotated to start at the lowest
+  // rank, stragglers skipped); healthyIndex is this rank's slot, -1 on the
+  // straggler. Healthy index i owns section i of every segment.
+  int straggler;
+  int healthyIndex;
+  int healthy[NCCL_OPTCC_MAX_HEALTHY];
 };
 
 // The root of each tree only has one node down (+1 intra-node).
@@ -594,9 +602,10 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 6; // TREE RING COLLNET_DIRECT COLLNET_CHAIN NVLS NVLS_TREE
+    nAlgos = 7; // TREE RING COLLNET_DIRECT COLLNET_CHAIN NVLS NVLS_TREE OPTCCRING
     if (coll == ncclFuncAllReduce) {
-      row += ((devRedOp*NumTypes + type)*nAlgos + algo)*NCCL_NUM_PROTOCOLS + proto;
+      int algo1 = algo == NCCL_ALGO_OPTCCRING ? 6 : algo;
+      row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;
