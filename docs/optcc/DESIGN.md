@@ -155,3 +155,60 @@ Branch `optcc-kernel` (on top of `optcc-rxlimit`).
 - **Fix:** when `NCCL_ALGO` names OptccRing, its connections are built at init also in runtime-connect mode, so the first collective has no setup work.
 - **Validation:** 80 of 80 runs clean with MPS on and default runtime connect, 64 MiB median 46.5 ms (unchanged). The chance of 0/80 at the old 4% rate is 0.96^80, about 4%.
 - **Logs:** `optcc results/20260925_rca/hang/` (DVC).
+
+## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
+
+No code change; this fixes how entry 1 is used. `NCCL_NET_RX_BURST_BYTES`
+must stay near one grant plus a bandwidth-delay product. The rig uses
+**256 KiB**; earlier campaigns used 4 MiB.
+
+**Finding (profiler traces, 64 MiB).** With a 4 MiB bucket, a receiver banks
+the credit of every idle moment and spends it later. The emulated NIC then
+runs faster than its cap whenever it has bubbles:
+- OptccRing straggler: 11.9-13.2 Gb/s against an 11.75 cap. At 16 MiB, 4 MiB is a quarter of the traffic.
+- Ring: 23.6-23.8 Gb/s against a 23.5 cap.
+
+A real half-speed port cannot store capacity, so this favours OptccRing: its
+bubbles are exactly the idle time that gets banked.
+
+With 256 KiB (2 grants at b512, 8 at b128):
+- the ring sits at 23.45 Gb/s;
+- the straggler sits at 11.77 Gb/s;
+- OptccRing l = 2 (8 channels x 128 KiB buffers) is 1.27x the ring at 128 MiB (was 1.26-1.27 with 4 MiB).
+
+A bucket of exactly one grant (`0`) under-delivers slightly: ring -1.6%.
+
+**Validation: the receive cap is a faithful stand-in for a slower link.**
+
+| Test | Receive cap only | Send cap only | Both caps |
+|---|---|---|---|
+| Ring l = 1, every rank, 128 MiB, 3 reps | 72.66 ms (VF 100G, RX 23500) | 72.96 ms (VF 25G, no RX cap) | 73.01 ms |
+| OptccRing l = 2, straggler only, 128 MiB, 3 reps | 93.77 ms | 93.06 ms | 95.10 ms |
+
+- The ring has one inbound flow per receiver; the straggler has several (8 channels x 4 healthy senders).
+- For OptccRing both directions carry n, so each cap alone must give the same time.
+- `results/20260925_rxab`, `20260925_stragab`.
+
+**How this relates to multi-tenant practice.**
+- The cap is receiver-driven admission. NCCL's CTS is the grant, as with pHost/Homa/NDP grants and PicNIC's receiver-side ingress envelopes.
+- It is lossless: RoCE error counters and port drops were 0 in every checked run.
+- The alternatives, and why they were not used:
+  - Drop-based ingress policing (the AWS style): go-back-N RoCE collapses under loss.
+  - Hardware rate control at the senders driven by the receiver (EyeQ / Gatekeeper / Harmonic): see 4c.
+
+### 4c. Hardware alternative: receiver-forged CNPs (tried, blocked)
+
+Harmonic (NSDI'24) throttles RDMA senders by forging CNPs, which drives the
+senders' DCQCN rate limiters. A PoC (`cnp_send.py`, scapy RoCE CNP from node1's
+PF with vn3's addresses, to vn2's QPs paired with vn3's):
+- 119,836 CNPs sent; node0 `rp_cnp_handled` +119,836, `rp_cnp_ignored` 0, so the NIC accepts them.
+- The ring hop vn2 -> vn3 did not slow (73.2 ms per call before, during and after).
+- It also did not slow with `cc_params/rp_rate_to_set_on_first_cnp = rp_max_rate = 5000`.
+
+Cause: firmware runs the non-legacy CC algorithm (`ROCE_CC_LEGACY_DCQCN=False`,
+`mstconfig -d 81:00.1 q`). The debugfs `cc_params` are the legacy DCQCN knobs,
+and `USER_PROGRAMMABLE_CC=False`.
+
+Path, if wanted: `mstconfig set ROCE_CC_LEGACY_DCQCN=1` on both BF2s plus a
+portal power cycle, then a controller in the straggler's host that meters its
+VF's RX and sends CNPs. That is not doable unattended; the credit gate stays.
