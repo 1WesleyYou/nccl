@@ -180,8 +180,12 @@ Test: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before t
 
 - Fisher one-sided p = 0.12; p = 0.048 if the 2 / 42 rotation hangs are counted as baseline.
 - It points to the hypothesis but does not prove it.
-- The warm-up costs nothing, so the benchmark should do it before the first collective.
-- The real fix belongs in how the rig shares GPU1: MPS, or a different layout.
+**Correction (07:40): the warm-up is not a fix.**
+- The five-configuration rotation, with the warm-up on, still hung 3 times in about 236 runs. All three were the pipelined 4 x 256K run at 8 MiB.
+- So the 0 / 201 vs 3 / 201 difference above was chance.
+- What stands: one MPS client's first kernel never runs; the rate depends on the sequence of runs (0 / 120 when the same run repeats, 1-5% in rotations).
+- Until the root cause is found, campaigns rely on the per-run timeout and a rig rebuild.
+- The real fix belongs in how the rig shares GPU1: MPS, or a layout without a shared GPU.
 
 ## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
 
