@@ -16,6 +16,9 @@
 #include "transport.h"
 #include "shm.h"
 #include <assert.h>
+#include <algorithm>
+#include <chrono>
+#include <mutex>
 #include "register_inline.h"
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
@@ -176,6 +179,44 @@ struct setupReq {
 };
 
 NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
+
+// Receive-side rate limit (OptCC rig). The NIC caps a VF's TX (max_tx_rate)
+// but has no RX cap, so the receive half of a "25 Gb/s full-duplex node" is
+// enforced here: an irecv is posted only when a process-wide token bucket holds
+// its bytes. A sender can only write into a buffer the receiver has posted, so
+// bytes received <= rate * t + one post. 0 = off (upstream behaviour).
+// Rate counts payload bytes (Mbit/s); burst defaults to one post.
+NCCL_PARAM(NetRxMaxMbps, "NET_RX_MAX_MBPS", 0);
+NCCL_PARAM(NetRxBurstBytes, "NET_RX_BURST_BYTES", 0);
+
+struct rxTokenBucket {
+  std::mutex mutex;
+  double tokens = 0;  // bytes
+  std::chrono::steady_clock::time_point last;
+  bool started = false;
+};
+static rxTokenBucket rxBucket;
+
+// True, and the tokens are taken, if `bytes` may be posted now.
+static bool rxLimitTryConsume(size_t bytes) {
+  static const double rate = ncclParamNetRxMaxMbps() * 1e6 / 8;  // bytes/s
+  if (rate <= 0) return true;
+  static const double burst = (double)ncclParamNetRxBurstBytes();
+  const double cap = std::max(burst, (double)bytes);
+  std::lock_guard<std::mutex> lock(rxBucket.mutex);
+  auto now = std::chrono::steady_clock::now();
+  if (!rxBucket.started) {
+    rxBucket.tokens = cap;
+    rxBucket.started = true;
+  } else {
+    double dt = std::chrono::duration<double>(now - rxBucket.last).count();
+    rxBucket.tokens = std::min(cap, rxBucket.tokens + rate * dt);
+  }
+  rxBucket.last = now;
+  if (rxBucket.tokens < (double)bytes) return false;
+  rxBucket.tokens -= (double)bytes;
+  return true;
+}
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
 
@@ -1472,6 +1513,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         }
       }
       if (subCount) {
+        size_t postBytes = 0;
+        for (int i=0; i<subCount; i++) postBytes += sizes[i];
+        // Out of RX tokens: leave these steps unposted and retry on the next progress call.
+        if (!rxLimitTryConsume(postBytes)) continue;
         uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
