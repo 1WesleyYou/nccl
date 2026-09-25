@@ -271,6 +271,9 @@ ncclResult_t printProxyOp(struct ncclProxyArgs* op, int poolIndex, int opIndex) 
         else status = 'D'; // Done
       }
       printf(" %d%c/%d", sub->peer, status, sub->channelId);
+      // OptCC debugging: step progress of every sub, collectives included.
+      printf("{p%d r%d t%d d%d n%d}", (int)sub->posted, (int)sub->received, (int)sub->transmitted,
+             (int)sub->done, (int)sub->nsteps);
     } else {
       printf(" %d/%d", sub->peer, sub->channelId);
     }
