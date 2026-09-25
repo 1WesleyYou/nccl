@@ -263,3 +263,27 @@ hides behind the next segment's healthy-ring work.
 - Hangs: 2 of about 250 runs, both k = 16 on 4 channels at 8 MiB. Neither reproduced in 120 dedicated attempts, back to back or alternating with another configuration.
 - The original kernel also hung once tonight, in about 810 runs (6 x 128K, 16 MiB), with the same symptom: nothing after the NCCL banner.
 - So the hang may be the residual first-collective race rather than this reordering. Root cause open; not merged.
+
+## 6. Pattern stagger (branch `optcc-stagger`, experiment)
+
+**Why.** With one segment per channel (the paper's k = 4 on 4 channels), all four channels used to start together:
+- the two ordering-1 channels (A, C) run their reduce-scatter at the same time, then hit the straggler at the same time;
+- B and D do the same.
+
+The paper instead starts C and D one "body" after A and B (Fig. 6). A body is the time for the straggler to move one segment's four sections, `l * n/k` at the healthy rate.
+
+**Knob.**
+- `NCCL_OPTCC_STAGGER_NS` (default 0) stored in `ncclOptccRing::staggerNs`.
+- Every thread of a channel in the upper half of `[channelLo, channelHi]` spins on `%globaltimer` for that long before `front(0)`.
+- No barrier, so there is no divergence problem.
+- The data check passes with it on (0.5 ms, 4 x 256K, 8-128 MiB).
+
+**First results.** 128 MiB, 5 reps, pipelined kernel, time / straggler link bound:
+
+| k (segments), 4 channels | No stagger | Stagger one body | Paper (k+1)/k |
+|---|---|---|---|
+| k = 4 | 1.50 | 1.31 | 1.25 |
+| k = 8 | 1.37 | 1.14 | 1.125 |
+
+- Fine segments (4 x 256K): no effect, as expected, since the offset there is a fraction of one of many segments.
+- Missing piece: the body length depends on n and the rates. A real implementation would derive it, or synchronise C on A's progress instead of a timer.
