@@ -1412,6 +1412,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
 
 static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   int checkedNetAttr = 0;
+  bool rxThrottled = false;  // RX cap held back a post this call
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
     void* recvComm;
@@ -1516,7 +1517,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         size_t postBytes = 0;
         for (int i=0; i<subCount; i++) postBytes += sizes[i];
         // Out of RX tokens: leave these steps unposted and retry on the next progress call.
-        if (!rxLimitTryConsume(postBytes)) continue;
+        if (!rxLimitTryConsume(postBytes)) { rxThrottled = true; continue; }
         uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
@@ -1681,6 +1682,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       }
     }
   }
+  // Waiting for RX tokens is not idle: an idle proxy sched_yield()s, and on a
+  // loaded core that costs a scheduler slice (ms) before the post is retried.
+  // Set only here: an earlier idle = 0 would skip the completion checks above.
+  if (rxThrottled) args->idle = 0;
   return ncclSuccess;
 }
 

@@ -49,3 +49,15 @@ Without an RX cap, those receives would run faster than the model allows.
 **Checks.**
 - Ring AllReduce beta unchanged with the cap at 23500 (only one sender per receiver).
 - nccl-tests `alltoall` (4 senders into each receiver): per-rank RX rate = busbw drops to <= the cap, versus above the cap without it.
+
+### 1a. Throttled is not idle (fix)
+
+First rig run: ring AllReduce at 8 MiB went from 4.4 ms to 11.2 ms with the cap
+on (3 of 3 runs), while 256 MiB lost only ~1%. A fixed stall per collective,
+not a rate effect. Cause: when every post in a progress call is held back by
+the bucket, the op reports idle, and the proxy loop `sched_yield()`s; on the
+container's few NUMA-bound cores that costs a scheduler slice before the post
+is retried. Fix: a call that was throttled marks the op busy at the very end
+of `recvProxyProgress` (not at the throttle point: `idle = 0` there would take
+the early `return` and skip the completion checks). The proxy thread then
+spins on the bucket instead of yielding.
