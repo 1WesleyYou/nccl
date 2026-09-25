@@ -204,6 +204,7 @@ PF with vn3's addresses, to vn2's QPs paired with vn3's):
 - 119,836 CNPs sent; node0 `rp_cnp_handled` +119,836, `rp_cnp_ignored` 0, so the NIC accepts them.
 - The ring hop vn2 -> vn3 did not slow (73.2 ms per call before, during and after).
 - It also did not slow with `cc_params/rp_rate_to_set_on_first_cnp = rp_max_rate = 5000`.
+- Nor at the reduction-monitor period: a C raw-socket sender (`cnp_blast.c`) pushed 1.05 M CNPs in 3 s (350 k/s, one per QP every ~6 us); all were handled, none ignored, and the ring still ran at 73.0 ms.
 
 Cause: firmware runs the non-legacy CC algorithm (`ROCE_CC_LEGACY_DCQCN=False`,
 `mstconfig -d 81:00.1 q`). The debugfs `cc_params` are the legacy DCQCN knobs,
