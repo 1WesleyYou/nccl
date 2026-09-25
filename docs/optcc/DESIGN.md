@@ -247,3 +247,19 @@ hides behind the next segment's healthy-ring work.
   - The straggler sends raw(L+1) only after all sums of L-1 arrived, and every starter consumed raw(L) before sending them.
   - A healthy rank sends partial(L+1) only after the straggler answered L-1.
 - Off switch: `optcc-kernel` without this commit.
+
+**Status (2026-09-25 04:15).**
+- Data check passes: nccl-tests out-of-bounds 0 at 8-128 MiB and 12/24/48/96 MiB, for 4 x 512K, 8 x 128K and 4 x 4M.
+- Speed-up at l = 2, 128 MiB, interleaved with the original (4 rounds):
+
+  | Configuration | Change |
+  |---|---|
+  | k = 8 on 4 channels | -14% |
+  | k = 16 on 4 channels | -7% |
+  | 4 x 512K | -1.4% |
+  | 8 x 128K | 0% (already at the bound's edge) |
+  | one segment per channel | 0% (nothing to overlap) |
+
+- Hangs: 2 of about 250 runs, both k = 16 on 4 channels at 8 MiB. Neither reproduced in 120 dedicated attempts, back to back or alternating with another configuration.
+- The original kernel also hung once tonight, in about 810 runs (6 x 128K, 16 MiB), with the same symptom: nothing after the NCCL banner.
+- So the hang may be the residual first-collective race rather than this reordering. Root cause open; not merged.
