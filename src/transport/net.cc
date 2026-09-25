@@ -117,6 +117,7 @@ struct sendNetResources {
 
 struct recvNetResources {
   struct connectMap map;
+  size_t rxPosted[NCCL_STEPS];  // RX cap: bytes posted per step slot, to refund what did not arrive
   void* netListenComm;
   void* netRecvComm;
   struct ncclSendMem* sendMem;
@@ -216,6 +217,15 @@ static bool rxLimitTryConsume(size_t bytes) {
   if (rxBucket.tokens < (double)bytes) return false;
   rxBucket.tokens -= (double)bytes;
   return true;
+}
+
+// A post is charged at its buffer size; the step usually carries less (small
+// or tail messages). Give back the difference when it completes, so the cap
+// counts bytes received, not buffers offered.
+static void rxLimitRefund(size_t bytes) {
+  if (bytes == 0 || ncclParamNetRxMaxMbps() <= 0) return;
+  std::lock_guard<std::mutex> lock(rxBucket.mutex);
+  rxBucket.tokens += (double)bytes;  // clamped to the depth on the next take
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
@@ -1507,6 +1517,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             sizes[subCount] = stepSize*args->sliceSteps;
           }
           if (sub->nbytes < sizes[subCount]) sizes[subCount] = sub->nbytes;
+          resources->rxPosted[buffSlot] = sizes[subCount];
           tags[subCount] = resources->tpRemoteRank;
           mhandles[subCount] = sub->recvMhandle;
           phandles[subCount] = &sub->pHandles[DIVUP(postedStepId, args->sliceSteps)%NCCL_STEPS];
@@ -1563,6 +1574,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct recvNetResources* resources = (struct recvNetResources*)(sub->connection->transportResources);
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
+            if (resources->rxPosted[buffSlot] > (size_t)sizes[i]) rxLimitRefund(resources->rxPosted[buffSlot] - sizes[i]);
+            resources->rxPosted[buffSlot] = 0;
             sub->transSize = sizes[i];
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);

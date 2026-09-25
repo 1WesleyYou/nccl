@@ -61,3 +61,15 @@ is retried. Fix: a call that was throttled marks the op busy at the very end
 of `recvProxyProgress` (not at the throttle point: `idle = 0` there would take
 the early `return` and skip the completion checks). The proxy thread then
 spins on the bucket instead of yielding.
+
+### 1b. Charge bytes received, not buffers posted (fix)
+
+1a did not change the 8 MiB number (still 11.2 ms, 3/3), so the stall was not
+the yield. What the data fit instead: a post reserves a whole step buffer
+(Simple: stepSize x sliceSteps, about 1 MiB) while a step of a small message
+carries far less, so the bucket charged several times the real bytes and a
+single-sender 8 MiB ring was held to ~9.6 Gb/s; at 256 MiB steps are full and
+the error vanishes (the measured +1%). Fix: remember the posted size per step
+slot (`recvNetResources::rxPosted`) and refund posted - received when the step
+completes. The cap now counts bytes received. 1a is kept: it is still right
+that waiting for tokens is not idleness.
