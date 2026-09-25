@@ -141,8 +141,17 @@ Branch `optcc-kernel` (on top of `optcc-rxlimit`).
 - Give OptccRing its own smaller chunk in `calcCollChunking` instead of a comm-wide buffer size, so the ring keeps its default. Not done: the buffer knob already leaves the ring unchanged here, and a code default needs the same validation again.
 - Overlap the next segment's ring stage with the current straggler stage inside one channel (split the block into two thread groups), the structural version of the same fix.
 
-**Open: intermittent hang.**
-- About 4% of OptccRing runs (5 of ~120 on 2026-09-24/25) hang in their first collective. It has hit both l, both buffer sizes, 1-64 MiB, with and without the RX cap, with and without a fresh VF re-cap.
-- The one proxy dump taken (collective sub progress was not printed then) showed every connection's first collective still active on all ranks.
-- `24c42d79` makes the dump print posted/received/transmitted/done/nsteps per sub; `diag.sh hunt2` is catching one, and also A/B-tests eager connect (NCCL_RUNTIME_CONNECT=0).
-- Campaigns survive it: run timeout, rig rebuild (a killed hung run breaks MPS), and refill.
+**Intermittent hang: found and fixed (`0501bbff`).**
+- **Symptom:** about 4% of OptccRing runs (5 of ~120) hung in their first collective.
+- **What the dumps showed:**
+  - With per-sub steps in the proxy dump (`24c42d79`), exactly one rank's GPU had done nothing on any channel: data had arrived (`r8 t8`) but was never consumed (`d0`), and nothing had been sent. Every other rank was waiting on it.
+  - That rank was vn2 in one hang and vn0 in the next: the two ranks that share GPU1 through MPS.
+  - gdb from the host showed every rank's main thread past the launches, in `cudaStreamSynchronize`, so the kernels had been issued.
+- **Isolation, 40 runs each:**
+  - OptccRing with MPS off: 0 hangs, but 3x slower, because vn0 and vn2 time-slice GPU1;
+  - ring with MPS on: 0;
+  - OptccRing with eager connect (`NCCL_RUNTIME_CONNECT=0`): 0.
+- **Cause:** the lazy connect path. At the first OptccRing collective, `ncclTransportOptccConnect` runs, including `ncclTransportP2pSetup` and its device-side copies. On an MPS-shared GPU this can leave one client's first kernel unable to run while the other client's kernel, already resident, waits for it.
+- **Fix:** when `NCCL_ALGO` names OptccRing, its connections are built at init also in runtime-connect mode, so the first collective has no setup work.
+- **Validation:** 80 of 80 runs clean with MPS on and default runtime connect, 64 MiB median 46.5 ms (unchanged). The chance of 0/80 at the old 4% rate is 0.96^80, about 4%.
+- **Logs:** `optcc results/20260925_rca/hang/` (DVC).
