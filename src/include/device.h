@@ -193,6 +193,7 @@ struct ncclOptccRing {
   // straggler. Healthy index i owns section i of every segment.
   int straggler;
   int healthyIndex;
+  int staggerNs; // NCCL_OPTCC_STAGGER_NS: upper half of the channels starts this much later (0 = off)
   int healthy[NCCL_OPTCC_MAX_HEALTHY];
 };
 

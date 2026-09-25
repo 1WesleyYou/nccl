@@ -120,6 +120,15 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
     };
 
     if (nLoops == 0) return;
+    // Optional stagger (NCCL_OPTCC_STAGGER_NS): the upper half of the channels
+    // (patterns C / D) starts later, like the paper's four-pattern overlay where
+    // C and D begin one body after A and B (Fig. 6). Every thread spins on the
+    // global timer by itself, so no block barrier is involved. Off by default.
+    const int nch = work->channelHi - work->channelLo + 1;
+    if (oc->staggerNs > 0 && ncclShmem.channelId - work->channelLo >= nch / 2) {
+      const unsigned long long t0 = globaltimer();
+      while (globaltimer() - t0 < (unsigned long long)oc->staggerNs) {}
+    }
     front(0);
     for (ssize_t L = 1; L < nLoops; ++L) { front(L); back(L - 1); }
     back(nLoops - 1);
