@@ -1297,6 +1297,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclNvlsSetup(comm, parent), ret, fail);
     // Check if we can setup CollNet
     if (comm->config.collnetEnable) ncclCollNetSetup(comm, parent, graphs);
+    // OptCC connects at init even in runtime-connect mode. Connecting lazily at
+    // the first OptccRing collective hung ~4% of runs on the MPS-shared GPU
+    // (one of the two ranks' kernels never ran); eager connect: 0 of 40.
+    if (ncclOptccRequested()) NCCLCHECKGOTO(ncclTransportOptccConnect(comm), ret, fail);
   } else {
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
