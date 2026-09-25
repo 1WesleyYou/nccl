@@ -12,6 +12,10 @@
  * folds it in with recvReduceSend on its first hop; the owner returns the
  * global sum last. Channels run concurrently, so the healthy ring of one
  * channel overlaps the straggler link of another, as the paper's patterns do.
+ * Within a channel, segments are software-pipelined one deep: front(L+1)
+ * (up to the hand-off across the straggler link) runs before back(L) (from
+ * the answer on), so the segment's wait for the straggler hides behind the
+ * next segment's work, as in the paper's composite schedule (Sec. 4.3).
  *
  * Every stage is a Primitives object with one recv and one send peer, built
  * in its own scope: its destructor writes the connection steps back, so the
@@ -37,44 +41,42 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
     ssize_t gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr, &gridOffset, &channelCount, &chunkCount);
     const ssize_t loopCount = nh * chunkCount;
+    const ssize_t nLoops = divUp(channelCount, loopCount);
+    auto mod = [&]__device__(int j)->int { return ((j % nh) + nh) % nh; };
+    // Segment L (one loop): the tail segment has a smaller chunk.
+    auto segChunk = [&]__device__(ssize_t L)->ssize_t {
+      ssize_t rem = channelCount - L * loopCount;
+      return rem < loopCount ? alignUp(divUp(rem, nh), 16/sizeof(T)) : chunkCount;
+    };
+    // Section j of segment L: offset and length (<= 0 on an empty tail; the
+    // primitive still runs so every connection advances the same steps).
+    auto off = [&]__device__(ssize_t L, int j)->ssize_t { return gridOffset + L * loopCount + (ssize_t)mod(j) * segChunk(L); };
+    auto len = [&]__device__(ssize_t L, int j)->int {
+      return (int)min(segChunk(L), channelCount - L * loopCount - (ssize_t)mod(j) * segChunk(L));
+    };
 
-    for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
-      ssize_t remCount = channelCount - elemOffset;
-      if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nh), 16/sizeof(T));
-      auto mod = [&]__device__(int j)->int { return ((j % nh) + nh) % nh; };
-      // Section j of this segment: offset and length (<= 0 on an empty tail;
-      // the primitive still runs so every connection advances the same steps).
-      auto off = [&]__device__(int j)->ssize_t { return gridOffset + elemOffset + (ssize_t)mod(j) * chunkCount; };
-      auto len = [&]__device__(int j)->int { return (int)min(chunkCount, remCount - (ssize_t)mod(j) * chunkCount); };
-
+    // Each segment is split where it waits on the other side of the straggler
+    // link: front(L) runs up to its hand-off, back(L) from the answer on.
+    // Segments are software-pipelined one deep, front(L+1) before back(L)
+    // (the paper's composite schedule: one segment's straggler exchange hides
+    // behind the next segment's healthy-ring work). Every rank issues the same
+    // sequence, so each connection still sees one fixed order of chunks.
+    auto front = [&]__device__(ssize_t L) {
       if (hi >= 0) {
-        // ---- healthy rank ----
         if (ordering == 2) {  // S3 + first hop of S1: straggler's raw section (hi-1) + ours -> next
           Prims p(tid, nthreads, &S, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-          p.recvReduceSend(off(hi-1), len(hi-1));
+          p.recvReduceSend(off(L, hi-1), len(L, hi-1));
         }
         {
           Prims ring(tid, nthreads, &prev, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
           // S1 reduce-scatter (runRing's steps with nranks = nh, ringIx = hi)
-          if (ordering == 1) ring.send(off(hi-1), len(hi-1));
-          for (int j = 2; j < nh; ++j) ring.recvReduceSend(off(hi-j), len(hi-j));
-          ring.recvReduceCopy(off(hi), off(hi), len(hi));  // ordering 2: already the global sum
+          if (ordering == 1) ring.send(off(L, hi-1), len(L, hi-1));
+          for (int j = 2; j < nh; ++j) ring.recvReduceSend(off(L, hi-j), len(L, hi-j));
+          ring.recvReduceCopy(off(L, hi), off(L, hi), len(L, hi));  // ordering 2: already the global sum
         }
-        if (ordering == 1) {  // S2 + S3: partial up, global sum back into our section
-          Prims link(tid, nthreads, &S, &S, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-          link.sendFromOutput(off(hi), len(hi));
-          link.recv(off(hi), len(hi));
-        }
-        {
-          Prims ring(tid, nthreads, &prev, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-          // S4 allgather from the owned section
-          ring.sendFromOutput(off(hi), len(hi));
-          for (int j = 1; j < nh - 1; ++j) ring.recvCopySend(off(hi-j), len(hi-j));
-          ring.recv(off(hi+1), len(hi+1));
-        }
-        if (ordering == 2) {  // S2 last: global sum to the straggler
+        if (ordering == 1) {  // S2: partial up
           Prims link(tid, nthreads, &none, &S, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-          link.sendFromOutput(off(hi), len(hi));
+          link.sendFromOutput(off(L, hi), len(L, hi));
         }
       } else {
         // ---- straggler: one flow at a time, in healthy order ----
@@ -82,21 +84,44 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
           int h = oc->healthy[i];
           if (ordering == 1) {  // partial of section i in, + our input, result back
             Prims p(tid, nthreads, &h, &h, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-            p.recvReduceCopySend(off(i), off(i), len(i));
+            p.recvReduceCopySend(off(L, i), off(L, i), len(L, i));
           } else {  // S3: raw section i to the rank that starts its chain, healthy index i+1
             int starter = oc->healthy[mod(i+1)];
             Prims p(tid, nthreads, &none, &starter, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-            p.send(off(i), len(i));
-          }
-        }
-        if (ordering == 2) {
-          for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
-            int h = oc->healthy[i];
-            Prims p(tid, nthreads, &h, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-            p.recv(off(i), len(i));
+            p.send(off(L, i), len(L, i));
           }
         }
       }
-    }
+    };
+    auto back = [&]__device__(ssize_t L) {
+      if (hi >= 0) {
+        if (ordering == 1) {  // S3: the global sum back into our section
+          Prims link(tid, nthreads, &S, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+          link.recv(off(L, hi), len(L, hi));
+        }
+        {
+          Prims ring(tid, nthreads, &prev, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+          // S4 allgather from the owned section
+          ring.sendFromOutput(off(L, hi), len(L, hi));
+          for (int j = 1; j < nh - 1; ++j) ring.recvCopySend(off(L, hi-j), len(L, hi-j));
+          ring.recv(off(L, hi+1), len(L, hi+1));
+        }
+        if (ordering == 2) {  // S2 last: global sum to the straggler
+          Prims link(tid, nthreads, &none, &S, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+          link.sendFromOutput(off(L, hi), len(L, hi));
+        }
+      } else if (ordering == 2) {
+        for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
+          int h = oc->healthy[i];
+          Prims p(tid, nthreads, &h, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+          p.recv(off(L, i), len(L, i));
+        }
+      }
+    };
+
+    if (nLoops == 0) return;
+    front(0);
+    for (ssize_t L = 1; L < nLoops; ++L) { front(L); back(L - 1); }
+    back(nLoops - 1);
   }
 };
