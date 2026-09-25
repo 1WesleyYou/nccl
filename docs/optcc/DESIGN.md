@@ -156,6 +156,23 @@ Branch `optcc-kernel` (on top of `optcc-rxlimit`).
 - **Validation:** 80 of 80 runs clean with MPS on and default runtime connect, 64 MiB median 46.5 ms (unchanged). The chance of 0/80 at the old 4% rate is 0.96^80, about 4%.
 - **Logs:** `optcc results/20260925_rca/hang/` (DVC).
 
+### 3b. The first-collective hang is not gone (2026-09-25 night)
+
+With `0501bbff` the hang became rare, but it still happens:
+- 1 in about 810 campaign runs;
+- far more often in a rotation of five configurations. 8 channels x 128K at 8 MiB, right after 4 x 512K at 64 MiB, hung 2 of 42 times.
+
+Two captures (`optcc results/20260925_hang_long/`: proxy dump via `NCCL_PROXY_DUMP_SIGNAL=10`, gdb stacks):
+- Every rank's main thread is in `cudaStreamSynchronize` after queueing the 10 warmup calls, so all kernels were launched.
+- In the first collective, one of the two MPS clients on GPU1 has `done = 0` on every connection. Its receive data sits in the FIFO (`r8 t8`) and its sends never start. It was vn0 in one capture and vn2 in the other.
+- The other client on that GPU, and every other rank, made progress and then waited.
+
+So one process's first kernel never runs while its GPU neighbour's kernel is already spinning. The earlier lazy-connect fix removed the most likely trigger (setup work between init and the first kernel), not the race itself.
+
+Hypothesis: under MPS, a client's first kernel can be held back while the other client's kernel occupies the GPU.
+
+Test in progress: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before the first collective) against the same pair, `optcc diag/prekernel_ab.sh`.
+
 ## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
 
 No code change; this fixes how entry 1 is used. `NCCL_NET_RX_BURST_BYTES`
