@@ -171,7 +171,17 @@ So one process's first kernel never runs while its GPU neighbour's kernel is alr
 
 Hypothesis: under MPS, a client's first kernel can be held back while the other client's kernel occupies the GPU.
 
-Test in progress: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before the first collective) against the same pair, `optcc diag/prekernel_ab.sh`.
+Test: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before the first collective) against the same pair, arms interleaved (`optcc diag/prekernel_ab*.sh`).
+
+| Arm | Hangs |
+|---|---|
+| Warm-up | 0 / 201 |
+| Without | 3 / 201 |
+
+- Fisher one-sided p = 0.12; p = 0.048 if the 2 / 42 rotation hangs are counted as baseline.
+- It points to the hypothesis but does not prove it.
+- The warm-up costs nothing, so the benchmark should do it before the first collective.
+- The real fix belongs in how the rig shares GPU1: MPS, or a different layout.
 
 ## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
 
