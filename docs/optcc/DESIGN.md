@@ -187,6 +187,11 @@ Test: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before t
 - Until the root cause is found, campaigns rely on the per-run timeout and a rig rebuild.
 - The real fix belongs in how the rig shares GPU1: MPS, or a layout without a shared GPU.
 
+**More checks (08:00).**
+- `CUDA_MODULE_LOADING=EAGER` (per rank, `OPTCC_CUDA_MODULE_LOADING`): the same rotation still hung 2 times in 200 runs. So lazy module loading is not the cause.
+- The MPS server log (`/tmp/nvidia-mps-log/server.log` on node0) shows nothing during a hang. All clients go ACTIVE, and nothing is logged for the 45 s until the hunt kills the run.
+- The kernel log's Xid 31 MMU faults and MPS's "client encountered a fatal GPU error" appear at the kill (within 40 ms of the killed client's exit). They are a side effect of killing one client while its GPU neighbour still runs, not the cause.
+
 ## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
 
 No code change; this fixes how entry 1 is used. `NCCL_NET_RX_BURST_BYTES`
