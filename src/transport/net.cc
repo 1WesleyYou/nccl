@@ -120,8 +120,6 @@ struct sendNetResources {
 
 struct recvNetResources {
   struct connectMap map;
-  size_t rxPosted[NCCL_STEPS];  // RX cap: bytes posted per step slot, to refund what did not arrive
-  size_t rxLanded[NCCL_STEPS];  // RX cap (deliver pacing): bytes landed per step slot, charged when handed to the GPU
   void* netListenComm;
   void* netRecvComm;
   struct ncclSendMem* sendMem;
@@ -185,63 +183,6 @@ struct setupReq {
 
 NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 
-// Receive-side rate limit (OptCC rig). The NIC caps a VF's TX (max_tx_rate)
-// but has no RX cap, so the receive half of a "25 Gb/s full-duplex node" is
-// enforced here with a process-wide token bucket (payload Mbit/s, depth
-// NCCL_NET_RX_BURST_BYTES, at least one step). 0 = off (upstream behaviour).
-// Where the bucket is charged (NCCL_NET_RX_PACE_DELIVER, DESIGN.md 8):
-//   1 (default): when a landed step is handed to the GPU (recvTail). Buffers
-//     are posted as upstream does; data may land early at line rate, but the
-//     kernel sees it at the cap. Idle time cannot be banked beyond the depth.
-//   0: when an irecv is posted (the original rule). Posting keeps going while
-//     no data flows, so after an idle stretch the pre-posted buffers let the
-//     senders write far above the cap (24-26 MiB in the k = 4 runs).
-NCCL_PARAM(NetRxMaxMbps, "NET_RX_MAX_MBPS", 0);
-NCCL_PARAM(NetRxBurstBytes, "NET_RX_BURST_BYTES", 0);
-NCCL_PARAM(NetRxPaceDeliver, "NET_RX_PACE_DELIVER", 1);
-static bool rxPaceDeliver() {
-  static const bool on = ncclParamNetRxMaxMbps() > 0 && ncclParamNetRxPaceDeliver() != 0;
-  return on;
-}
-
-struct rxTokenBucket {
-  std::mutex mutex;
-  double tokens = 0;  // bytes
-  std::chrono::steady_clock::time_point last;
-  bool started = false;
-};
-static rxTokenBucket rxBucket;
-
-// True, and the tokens are taken, if `bytes` may be posted now.
-static bool rxLimitTryConsume(size_t bytes) {
-  static const double rate = ncclParamNetRxMaxMbps() * 1e6 / 8;  // bytes/s
-  if (rate <= 0) return true;
-  static const double burst = (double)ncclParamNetRxBurstBytes();
-  const double cap = std::max(burst, (double)bytes);
-  std::lock_guard<std::mutex> lock(rxBucket.mutex);
-  auto now = std::chrono::steady_clock::now();
-  if (!rxBucket.started) {
-    rxBucket.tokens = cap;
-    rxBucket.started = true;
-  } else {
-    double dt = std::chrono::duration<double>(now - rxBucket.last).count();
-    rxBucket.tokens = std::min(cap, rxBucket.tokens + rate * dt);
-  }
-  rxBucket.last = now;
-  if (rxBucket.tokens < (double)bytes) return false;
-  rxBucket.tokens -= (double)bytes;
-  return true;
-}
-
-// A post is charged at its buffer size; the step usually carries less (small
-// or tail messages). Give back the difference when it completes, so the cap
-// counts bytes received, not buffers offered.
-static void rxLimitRefund(size_t bytes) {
-  if (bytes == 0 || ncclParamNetRxMaxMbps() <= 0) return;
-  std::lock_guard<std::mutex> lock(rxBucket.mutex);
-  rxBucket.tokens += (double)bytes;  // clamped to the depth on the next take
-}
-
 // OptCC straggler flow arbiter (NCCL_OPTCC_SERIAL, DESIGN.md 7). The paper lets
 // a NIC carry one flow at a time. OptccRing's channels run independently, so
 // without this the straggler's NIC serves several healthy peers at once. With
@@ -254,7 +195,9 @@ static void rxLimitRefund(size_t bytes) {
 // ordering-2 raw send goes to healthy[i+1]). A flow in either order only waits
 // for flows earlier in the two orders, so they cannot deadlock; a flow whose
 // data is late keeps the link idle (head-of-line wait). A section is one chunk
-// (chunkSteps steps) of one connection. Bit 0: receive side, bit 1: send side,
+// (chunkSteps steps) of one connection; a receive section is done when the net
+// reports its last step received (with the netpace plugin's receive cap, when
+// that step is handed to the GPU). Bit 0: receive side, bit 1: send side,
 // bit 2: lookahead (the next section may start while the current one drains).
 // Safety valve: no progress on the current flow for NCCL_OPTCC_SERIAL_VALVE_MS
 // (default 5 s, well above the skew between ranks entering their first
@@ -367,7 +310,7 @@ static void optccArbAdvance(optccArbiter& a) {
     auto it = op->second.subs.find({ch, peer});
     if (it == op->second.subs.end()) { optccArbNext(a); continue; }  // its args already completed
     struct ncclProxySubArgs* sub = it->second;
-    uint64_t prog = a.send ? sub->done : (rxPaceDeliver() ? sub->transmitted : sub->received);
+    uint64_t prog = a.send ? sub->done : sub->received;
     uint64_t end = std::min<uint64_t>(lo + a.chunkSteps, sub->nsteps);
     if ((uint64_t)sub->nsteps > lo && prog < end) {
       auto now = std::chrono::steady_clock::now();
@@ -1612,7 +1555,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
 
 static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   int checkedNetAttr = 0;
-  bool rxThrottled = false;  // RX cap held back a post this call
+  bool recvHeld = false;  // the OptCC arbiter held back a post this call
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
     void* recvComm;
@@ -1674,7 +1617,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         if (sub->posted < sub->nsteps) {
           if (sub->posted >= sub->done + maxDepth) { subCount = 0; break; }
           // OptCC arbiter: only the connection whose section is due may offer buffers.
-          if (arb && !optccArbMay(optccArbRecv, args, sub, sub->posted)) { subCount = 0; rxThrottled = true; break; }
+          if (arb && !optccArbMay(optccArbRecv, args, sub, sub->posted)) { subCount = 0; recvHeld = true; break; }
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
@@ -1711,7 +1654,6 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             sizes[subCount] = stepSize*args->sliceSteps;
           }
           if (sub->nbytes < sizes[subCount]) sizes[subCount] = sub->nbytes;
-          resources->rxPosted[buffSlot] = sizes[subCount];
           tags[subCount] = resources->tpRemoteRank;
           mhandles[subCount] = sub->recvMhandle;
           phandles[subCount] = &sub->pHandles[DIVUP(postedStepId, args->sliceSteps)%NCCL_STEPS];
@@ -1719,11 +1661,6 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         }
       }
       if (subCount) {
-        size_t postBytes = 0;
-        for (int i=0; i<subCount; i++) postBytes += sizes[i];
-        // Out of RX tokens: leave these steps unposted and retry on the next progress call
-        // (post pacing only; deliver pacing charges when the data is handed to the GPU).
-        if (!rxPaceDeliver() && !rxLimitTryConsume(postBytes)) { rxThrottled = true; continue; }
         uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
@@ -1769,9 +1706,6 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct recvNetResources* resources = (struct recvNetResources*)(sub->connection->transportResources);
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
-            if (!rxPaceDeliver() && resources->rxPosted[buffSlot] > (size_t)sizes[i]) rxLimitRefund(resources->rxPosted[buffSlot] - sizes[i]);
-            resources->rxPosted[buffSlot] = 0;
-            resources->rxLanded[buffSlot] = sizes[i];
             sub->transSize = sizes[i];
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
@@ -1831,18 +1765,6 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         int done = 1;
         void* request = subGroup->requests[step%NCCL_STEPS];
         if (request) NCCLCHECK(proxyState->ncclNet->test(request, &done, NULL));
-        if (done && rxPaceDeliver()) {
-          // The flush (if any) completed: never test that request again, even if we wait below.
-          subGroup->requests[step%NCCL_STEPS] = NULL;
-          size_t bytes = 0;
-          for (int i=0; i<subGroup->groupSize; i++) {
-            struct ncclProxySubArgs* sub = subGroup + i;
-            struct recvNetResources* res = (struct recvNetResources*)(sub->connection->transportResources);
-            bytes += res->rxLanded[(sub->base + sub->transmitted) % NCCL_STEPS];
-          }
-          // Out of RX tokens: keep the landed data from the GPU and retry on the next progress call.
-          if (bytes > 0 && !rxLimitTryConsume(bytes)) { rxThrottled = true; continue; }
-        }
         if (done) {
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup + i;
@@ -1904,10 +1826,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       }
     }
   }
-  // Waiting for RX tokens is not idle: an idle proxy sched_yield()s, and on a
+  // Waiting for the arbiter is not idle: an idle proxy sched_yield()s, and on a
   // loaded core that costs a scheduler slice (ms) before the post is retried.
   // Set only here: an earlier idle = 0 would skip the completion checks above.
-  if (rxThrottled) args->idle = 0;
+  if (recvHeld) args->idle = 0;
   return ncclSuccess;
 }
 
