@@ -287,3 +287,25 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 
 - Fine segments (4 x 256K): no effect, as expected, since the offset there is a fraction of one of many segments.
 - Missing piece: the body length depends on n and the rates. A real implementation would derive it, or synchronise C on A's progress instead of a timer.
+
+## 7. Straggler flow arbiter (branch `optcc-serial`, experiment)
+
+**Why.** The paper lets a NIC carry one flow at a time. OptccRing's channels are independent CTAs, and the straggler posts receive buffers for every healthy peer up front. So the straggler's NIC serves several peers at once: in about half of the paper's time slots it exchanges data with two or more different healthy ranks (profiler, `scripts/prof_overlap.py`). A symmetric ring never does (0%).
+
+**Mechanism** (`src/transport/net.cc`, straggler's proxy only, `NCCL_OPTCC_SERIAL`: bit 0 receive, bit 1 send, default 0).
+- One token per direction. The straggler may post receive buffers (Stage 2), or issue sends (Stage 3), only for the (channel, healthy peer) section that holds the token. A section is one chunk, `chunkSteps` steps.
+- The token passes when the section completes: on receive when all its steps have landed, on send when all its sends have completed.
+- Orders, taken from the paper's schedule (Fig. 6):
+  - receive, per loop: ordering-1 channels (A, C), then ordering-2 channels (B, D);
+  - send, per loop: ordering-2 channels (B, D), then ordering-1 channels (A, C);
+  - within a channel, the kernel's section order: healthy index 0..nh-1; an ordering-2 raw send goes to healthy[i+1].
+- A flow in either order only depends on flows earlier in the two orders:
+  - A's results need A's receives;
+  - B's results need B's raw sends and the healthy ring;
+  - B's next raw section comes after C's results.
+
+  So the orders cannot deadlock. A flow whose data is late holds its link idle (a head-of-line wait).
+- Collectives are served in opCount order. An op starts only when all `nChannels x (nRanks - 1)` subs are registered, because the straggler's subs of one collective reach the proxy in several ProxyArgs.
+- Safety valve: if the current section makes no progress for `NCCL_OPTCC_SERIAL_VALVE_MS` (default 5000), the arbiter warns and switches itself off for the rest of the process.
+
+**Bug found on the way.** The first version started an op from the subs registered so far. It served one section, took the op for finished, and held the other 15 sections forever, so the next collective stalled. The valve caught it ("1 sections served").

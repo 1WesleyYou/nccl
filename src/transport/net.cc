@@ -243,7 +243,8 @@ static void rxLimitRefund(size_t bytes) {
 // ordering-2 raw send goes to healthy[i+1]). A flow in either order only waits
 // for flows earlier in the two orders, so they cannot deadlock; a flow whose
 // data is late keeps the link idle (head-of-line wait). A section is one chunk
-// (chunkSteps steps) of one connection. Bit 0: receive side, bit 1: send side.
+// (chunkSteps steps) of one connection. Bit 0: receive side, bit 1: send side,
+// bit 2: lookahead (the next section may start while the current one drains).
 // Safety valve: no progress on the current flow for NCCL_OPTCC_SERIAL_VALVE_MS
 // (default 5 s, well above the skew between ranks entering their first
 // collective) switches the arbiter off, with a warning, for the rest of the process.
@@ -371,15 +372,33 @@ static void optccArbAdvance(optccArbiter& a) {
   }
 }
 
-// May this sub post (receive) or issue (send) `step` now?
+// May this sub post (receive) or issue (send) `step` now? With lookahead
+// (NCCL_OPTCC_SERIAL bit 2), the next section may start once the current one
+// has posted / issued all its steps, so the hand-over round trip overlaps the
+// current section's last step instead of idling the link.
 static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct ncclProxySubArgs* sub, uint64_t step) {
+  static const bool lookahead = ncclParamOptccSerial() & 4;
   std::lock_guard<std::mutex> lock(a.mu);
   if (a.dead) return true;
   optccArbAdvance(a);
-  if (a.dead) return true;
+  if (a.dead || args->opCount != a.cur) return a.dead;
   int ch, peer;
-  return args->opCount == a.cur && optccArbHolder(a, &ch, &peer) && sub->channelId == ch && sub->peer == peer &&
-         step >= (uint64_t)a.j * a.chunkSteps && step < (uint64_t)(a.j + 1) * a.chunkSteps;
+  if (!optccArbHolder(a, &ch, &peer)) return false;
+  uint64_t lo = (uint64_t)a.j * a.chunkSteps;
+  if (sub->channelId == ch && sub->peer == peer) return step >= lo && step < lo + a.chunkSteps;
+  if (!lookahead) return false;
+  auto op = a.ops.find(a.cur);
+  auto it = op->second.subs.find({ch, peer});
+  if (it != op->second.subs.end()) {
+    uint64_t issued = a.send ? it->second->transmitted : it->second->posted;
+    if (issued < std::min<uint64_t>(lo + a.chunkSteps, it->second->nsteps)) return false;
+  }
+  int j = a.j, q = a.q, i = a.i;                 // the section after the current one
+  if (++i == (int)a.healthy.size()) { i = 0; if (++q == (int)a.order.size()) { q = 0; j++; } }
+  int c = a.order[q], nh = (int)a.healthy.size();
+  int p = a.healthy[(a.send && c % 2 == 1) ? (i + 1) % nh : i];
+  uint64_t lo2 = (uint64_t)j * a.chunkSteps;
+  return sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + a.chunkSteps;
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
