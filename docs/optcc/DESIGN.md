@@ -361,4 +361,10 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 
 **Why at the hand-over.** A real half-speed port backpressures the senders on the wire. The rig can only withhold credit, and credit can pile up while nothing flows. Pacing when data becomes usable is the closest observable: the receiver's kernel cannot run ahead of the cap. The senders' writes do complete earlier than on a real port, so a sender's own FIFO frees up sooner. It still cannot get further ahead than the receiver's posted buffers (4 slices per connection).
 
-**Profiler.** A receive step now has three times: landing (`RecvWait` end), hand-over (`RecvGpuWait` begin), and GPU done. `prof_timeline.py` counts a receive at the hand-over.
+**Profiler.** A receive step now has three times: landing (`RecvWait` end), hand-over (`RecvGpuWait` begin), and GPU done. `prof_timeline.py` counts a receive at the hand-over, and a call's span ends at the later of landing and hand-over: a landed step can wait several ms (up to 8 ms in the k = 4 runs) before the kernel gets it.
+
+**Results** (optcc `REPORT_RXFIX`, results `20260926_rxfix*`, `20260926_prof9`).
+- Straggler receive rate per call, counted at the hand-over, k = 4 at 64 MiB (three profiles, 15 calls): 7.3–11.6 Gbit/s, none above the cap. The old rule: 6 of 15 above, up to 19.9.
+- The first 5 ms after the idle head: 13.4 Gbit/s (old 23.5). The rest above the cap is one 2 MiB step.
+- nccl-tests `-c 1` correct at 8–128 MiB, arbiter off and on.
+- Timing, 4 rounds, same-round A/B: the original kernel at k = 4 is 38% / 12% slower at 64 / 128 MiB, which is what the leak gave it. Fine segments move 0.4–2.5%. The best configuration (original kernel, `NCCL_OPTCC_SERIAL=7`, 4 x 256K) is 1.240x ring at 128 MiB, 1.005x the bound; k = 256 there, so the paper's (k+1)/k is 1.004.
