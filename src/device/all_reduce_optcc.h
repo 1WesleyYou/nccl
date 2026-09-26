@@ -80,13 +80,23 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
         // ---- straggler: one flow at a time, in healthy order ----
         for (int i = 0; i < nh; ++i) {
           int h = oc->healthy[i];
-          if (ordering == 1) {  // partial of section i in, + our input, result back
-            Prims p(tid, nthreads, &h, &h, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-            p.recvReduceCopySend(off(i), off(i), len(i));
+          if (ordering == 1) {  // S2: partial of section i in, + our input, kept in the output
+            Prims p(tid, nthreads, &h, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+            p.recvReduceCopy(off(i), off(i), len(i));
           } else {  // S3: raw section i to the rank that starts its chain, healthy index i+1
             int starter = oc->healthy[mod(i+1)];
             Prims p(tid, nthreads, &none, &starter, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
             p.send(off(i), len(i));
+          }
+        }
+        if (ordering == 1) {
+          // S3 as its own stage, after all of S2, as in the paper: with the arbiter
+          // serving sends B, D before A, C, a fused receive-and-return stalled the
+          // receives of A / C until their returns were allowed (DESIGN.md 10).
+          for (int i = 0; i < nh; ++i) {
+            int h = oc->healthy[i];
+            Prims p(tid, nthreads, &none, &h, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+            p.sendFromOutput(off(i), len(i));
           }
         }
         if (ordering == 2) {
