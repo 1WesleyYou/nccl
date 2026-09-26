@@ -38,6 +38,14 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr, &gridOffset, &channelCount, &chunkCount);
     const ssize_t loopCount = nh * chunkCount;
 
+    // Optional stagger (NCCL_OPTCC_STAGGER_NS, as on optcc-serial): the upper half
+    // of the channels (patterns C / D) starts later, like the paper's overlay where
+    // C and D begin one body after A and B (Fig. 6). Each thread spins alone.
+    const int nch = work->channelHi - work->channelLo + 1;
+    if (oc->staggerNs > 0 && ncclShmem.channelId - work->channelLo >= nch / 2) {
+      const unsigned long long t0 = globaltimer();
+      while (globaltimer() - t0 < (unsigned long long)oc->staggerNs) {}
+    }
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
       ssize_t remCount = channelCount - elemOffset;
       if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nh), 16/sizeof(T));

@@ -6,6 +6,7 @@
 #include <string>
 
 NCCL_PARAM(OptccStraggler, "OPTCC_STRAGGLER", 2);
+NCCL_PARAM(OptccStaggerNs, "OPTCC_STAGGER_NS", 0);
 int ncclOptccStraggler() { return (int)ncclParamOptccStraggler(); }
 
 bool ncclOptccRequested() {
@@ -39,6 +40,7 @@ ncclResult_t ncclBuildOptccRings(int nChannels, const int* rings, struct ncclCom
     optcc->ringPrev = optcc->ringNext = -1;
     optcc->straggler = nStragglers > 0 ? stragglerRanks[0] : -1;
     optcc->healthyIndex = -1;
+    optcc->staggerNs = (int)ncclParamOptccStaggerNs();
     {
       // Canonical healthy order: this channel's ring, rotated to start at its lowest rank.
       const int* ord = rings+c*nranks;
