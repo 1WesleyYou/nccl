@@ -195,6 +195,7 @@ struct ncclOptccRing {
   int healthyIndex;
   int healthy[NCCL_OPTCC_MAX_HEALTHY];
   int staggerNs; // NCCL_OPTCC_STAGGER_NS: upper half of the channels starts this much later (0 = off)
+  int bfNum, bfDen; // NCCL_OPTCC_BF_NUM / _DEN = (2 - l) / l: bubble filling for l < 2 (0 = off)
 };
 
 // The root of each tree only has one node down (+1 intra-node).

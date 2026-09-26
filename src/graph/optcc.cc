@@ -7,6 +7,8 @@
 
 NCCL_PARAM(OptccStraggler, "OPTCC_STRAGGLER", 2);
 NCCL_PARAM(OptccStaggerNs, "OPTCC_STAGGER_NS", 0);
+NCCL_PARAM(OptccBfNum, "OPTCC_BF_NUM", 0);
+NCCL_PARAM(OptccBfDen, "OPTCC_BF_DEN", 1);
 int ncclOptccStraggler() { return (int)ncclParamOptccStraggler(); }
 
 bool ncclOptccRequested() {
@@ -41,6 +43,8 @@ ncclResult_t ncclBuildOptccRings(int nChannels, const int* rings, struct ncclCom
     optcc->straggler = nStragglers > 0 ? stragglerRanks[0] : -1;
     optcc->healthyIndex = -1;
     optcc->staggerNs = (int)ncclParamOptccStaggerNs();
+    optcc->bfNum = (int)ncclParamOptccBfNum();
+    optcc->bfDen = (int)ncclParamOptccBfDen();
     {
       // Canonical healthy order: this channel's ring, rotated to start at its lowest rank.
       const int* ord = rings+c*nranks;

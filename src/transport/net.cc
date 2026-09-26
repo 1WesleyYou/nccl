@@ -205,6 +205,8 @@ NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
 NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
 int64_t ncclParamOptccStraggler();
+int64_t ncclParamOptccBfNum();
+int64_t ncclParamOptccBfDen();
 
 struct optccArbOp {
   std::map<std::pair<int, int>, struct ncclProxySubArgs*> subs;  // (channel, peer) -> sub
@@ -281,6 +283,14 @@ static void optccArbBegin(optccArbiter& a) {
   a.healthy.assign(peers.begin(), peers.end());
 }
 
+// Steps of one flow per loop on channel ch: one section, or with bubble filling
+// on patterns A / C (even channels) the section and the P2P block behind it,
+// served as one flow so both go out without a hand-over in between.
+static uint64_t optccFlowSteps(const optccArbiter& a, int ch) {
+  static const bool bf = ncclParamOptccBfNum() > 0 && ncclParamOptccBfDen() > 0;
+  return (uint64_t)a.chunkSteps * ((bf && ch % 2 == 0) ? 2 : 1);
+}
+
 // Channel and peer of the section the arbiter is serving.
 static bool optccArbHolder(optccArbiter& a, int* ch, int* peer) {
   if (a.order.empty() || a.healthy.empty()) return false;
@@ -303,15 +313,16 @@ static void optccArbAdvance(optccArbiter& a) {
     auto op = a.ops.find(a.cur);
     int ch, peer;
     if (op == a.ops.end() || !optccArbHolder(a, &ch, &peer)) { a.cur = UINT64_MAX; continue; }
-    uint64_t lo = (uint64_t)a.j * a.chunkSteps;
+    uint64_t lo = (uint64_t)a.j * optccFlowSteps(a, ch);
     bool left = false;
-    for (auto& kv : op->second.subs) if ((uint64_t)kv.second->nsteps > lo) { left = true; break; }
+    for (auto& kv : op->second.subs)
+      if ((uint64_t)kv.second->nsteps > (uint64_t)a.j * optccFlowSteps(a, kv.first.first)) { left = true; break; }
     if (!left) { a.ops.erase(op); a.cur = UINT64_MAX; continue; }   // every section of this op was served
     auto it = op->second.subs.find({ch, peer});
     if (it == op->second.subs.end()) { optccArbNext(a); continue; }  // its args already completed
     struct ncclProxySubArgs* sub = it->second;
     uint64_t prog = a.send ? sub->done : sub->received;
-    uint64_t end = std::min<uint64_t>(lo + a.chunkSteps, sub->nsteps);
+    uint64_t end = std::min<uint64_t>(lo + optccFlowSteps(a, ch), sub->nsteps);
     if ((uint64_t)sub->nsteps > lo && prog < end) {
       auto now = std::chrono::steady_clock::now();
       if (prog != a.lastProg) { a.lastProg = prog; a.since = now; }
@@ -338,21 +349,21 @@ static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct nccl
   if (a.dead || args->opCount != a.cur) return a.dead;
   int ch, peer;
   if (!optccArbHolder(a, &ch, &peer)) return false;
-  uint64_t lo = (uint64_t)a.j * a.chunkSteps;
-  if (sub->channelId == ch && sub->peer == peer) return step >= lo && step < lo + a.chunkSteps;
+  uint64_t lo = (uint64_t)a.j * optccFlowSteps(a, ch);
+  if (sub->channelId == ch && sub->peer == peer) return step >= lo && step < lo + optccFlowSteps(a, ch);
   if (!lookahead) return false;
   auto op = a.ops.find(a.cur);
   auto it = op->second.subs.find({ch, peer});
   if (it != op->second.subs.end()) {
     uint64_t issued = a.send ? it->second->transmitted : it->second->posted;
-    if (issued < std::min<uint64_t>(lo + a.chunkSteps, it->second->nsteps)) return false;
+    if (issued < std::min<uint64_t>(lo + optccFlowSteps(a, ch), it->second->nsteps)) return false;
   }
   int j = a.j, q = a.q, i = a.i;                 // the section after the current one
   if (++i == (int)a.healthy.size()) { i = 0; if (++q == (int)a.order.size()) { q = 0; j++; } }
   int c = a.order[q], nh = (int)a.healthy.size();
   int p = a.healthy[(a.send && c % 2 == 1) ? (i + 1) % nh : i];
-  uint64_t lo2 = (uint64_t)j * a.chunkSteps;
-  return sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + a.chunkSteps;
+  uint64_t lo2 = (uint64_t)j * optccFlowSteps(a, c);
+  return sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + optccFlowSteps(a, c);
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");

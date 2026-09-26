@@ -37,6 +37,14 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
     ssize_t gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr, &gridOffset, &channelCount, &chunkCount);
     const ssize_t loopCount = nh * chunkCount;
+    // Bubble filling for l < 2 (paper Sec. 4.2 and App. C; NCCL_OPTCC_BF_NUM /
+    // _DEN = r = (2 - l) / l). On patterns A / C every straggler flow carries,
+    // right behind its section on the same connection, x = r s' elements of a
+    // point-to-point allreduce through the straggler: each healthy rank sends
+    // its raw block, the straggler sums the four and its own and returns the sum
+    // with every S3 flow. The loop keeps its size (so the proxy's loop count
+    // holds), its sections shrink to s' = nh c / (nh + r) and the block takes the rest.
+    const bool bf = ordering == 1 && oc->bfNum > 0 && oc->bfDen > 0;
 
     // Optional stagger (NCCL_OPTCC_STAGGER_NS, as on optcc-serial): the upper half
     // of the channels (patterns C / D) starts later, like the paper's overlay where
@@ -49,11 +57,18 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
       ssize_t remCount = channelCount - elemOffset;
       if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nh), 16/sizeof(T));
+      ssize_t sec = chunkCount, p2pN = 0;
+      if (bf) {
+        const ssize_t seg = min(loopCount, remCount);
+        sec = alignUp(divUp(seg * oc->bfDen, (ssize_t)nh * oc->bfDen + oc->bfNum), 16/sizeof(T));
+        p2pN = max((ssize_t)0, seg - (ssize_t)nh * sec);
+      }
       auto mod = [&]__device__(int j)->int { return ((j % nh) + nh) % nh; };
       // Section j of this segment: offset and length (<= 0 on an empty tail;
       // the primitive still runs so every connection advances the same steps).
-      auto off = [&]__device__(int j)->ssize_t { return gridOffset + elemOffset + (ssize_t)mod(j) * chunkCount; };
-      auto len = [&]__device__(int j)->int { return (int)min(chunkCount, remCount - (ssize_t)mod(j) * chunkCount); };
+      auto off = [&]__device__(int j)->ssize_t { return gridOffset + elemOffset + (ssize_t)mod(j) * sec; };
+      auto len = [&]__device__(int j)->int { return (int)min(sec, remCount - (ssize_t)mod(j) * sec); };
+      const ssize_t p2pOff = gridOffset + elemOffset + (ssize_t)nh * sec;  // the P2P block, after the sections
 
       if (hi >= 0) {
         // ---- healthy rank ----
@@ -71,7 +86,9 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
         if (ordering == 1) {  // S2 + S3: partial up, global sum back into our section
           Prims link(tid, nthreads, &S, &S, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
           link.sendFromOutput(off(hi), len(hi));
+          if (bf) link.send(p2pOff, (int)p2pN);   // bubble: our raw block, right behind the section
           link.recv(off(hi), len(hi));
+          if (bf) link.recv(p2pOff, (int)p2pN);   // bubble: the block's global sum
         }
         {
           Prims ring(tid, nthreads, &prev, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
@@ -89,8 +106,15 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
         for (int i = 0; i < nh; ++i) {
           int h = oc->healthy[i];
           if (ordering == 1) {  // S2: partial of section i in, + our input, kept in the output
-            Prims p(tid, nthreads, &h, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
-            p.recvReduceCopy(off(i), off(i), len(i));
+            {
+              Prims p(tid, nthreads, &h, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+              p.recvReduceCopy(off(i), off(i), len(i));
+              if (bf && i == 0) p.recvReduceCopy(p2pOff, p2pOff, (int)p2pN);  // bubble: our block + the first one
+            }
+            if (bf && i > 0) {  // bubble: add this rank's block to the running sum in the output
+              Prims q(tid, nthreads, &h, &none, work->recvbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+              q.recvReduceCopy(p2pOff, p2pOff, (int)p2pN);
+            }
           } else {  // S3: raw section i to the rank that starts its chain, healthy index i+1
             int starter = oc->healthy[mod(i+1)];
             Prims p(tid, nthreads, &none, &starter, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
@@ -105,6 +129,7 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &none, &h, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
             p.sendFromOutput(off(i), len(i));
+            if (bf) p.sendFromOutput(p2pOff, (int)p2pN);  // bubble: the block's sum, right behind the section
           }
         }
         if (ordering == 2) {
