@@ -24,7 +24,9 @@
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
-    using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS/ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
+    // One slice per chunk (NCCL's ring uses two): half the per-step handshakes per
+    // chunk; enqueue.cc gives the proxy sliceSteps = chunkSteps to match (DESIGN.md 11).
+    using Proto = ProtoSimple<1, ALLREDUCE_CHUNKSTEPS>;
     // FanAsymmetric: send-only / recv-only stages pass -1 for the other side,
     // and FanSymmetric would take the recv count for both.
     using Prims = Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0>;
