@@ -244,9 +244,11 @@ static void rxLimitRefund(size_t bytes) {
 // for flows earlier in the two orders, so they cannot deadlock; a flow whose
 // data is late keeps the link idle (head-of-line wait). A section is one chunk
 // (chunkSteps steps) of one connection. Bit 0: receive side, bit 1: send side.
-// Safety valve: no progress on the current flow for 200 ms switches the arbiter
-// off (with a warning) for the rest of the process.
+// Safety valve: no progress on the current flow for NCCL_OPTCC_SERIAL_VALVE_MS
+// (default 5 s, well above the skew between ranks entering their first
+// collective) switches the arbiter off, with a warning, for the rest of the process.
 NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
+NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
 int64_t ncclParamOptccStraggler();
 
 struct optccArbiter {
@@ -340,9 +342,9 @@ static void optccArbAdvance(optccArbiter& a) {
     if ((uint64_t)sub->nsteps > lo && prog < end) {
       auto now = std::chrono::steady_clock::now();
       if (prog != a.lastProg) { a.lastProg = prog; a.since = now; }
-      else if (now - a.since > std::chrono::milliseconds(200)) {
-        WARN("OptCC serial arbiter (%s): channel %d peer %d made no progress for 200 ms at step %lu/%d, switching the arbiter off",
-             a.send ? "send" : "recv", ch, peer, prog, sub->nsteps);
+      else if (now - a.since > std::chrono::milliseconds(ncclParamOptccSerialValveMs())) {
+        WARN("OptCC serial arbiter (%s): channel %d peer %d made no progress for %ld ms at step %lu/%d, switching the arbiter off",
+             a.send ? "send" : "recv", ch, peer, (long)ncclParamOptccSerialValveMs(), prog, sub->nsteps);
         a.dead = true;
       }
       return;
