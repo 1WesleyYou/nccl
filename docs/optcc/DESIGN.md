@@ -309,3 +309,36 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 - Safety valve: if the current section makes no progress for `NCCL_OPTCC_SERIAL_VALVE_MS` (default 5000), the arbiter warns and switches itself off for the rest of the process.
 
 **Bug found on the way.** The first version started an op from the subs registered so far. It served one section, took the op for finished, and held the other 15 sections forever, so the next collective stalled. The valve caught it ("1 sections served").
+
+**Checks.**
+- nccl-tests `-c 1` (varied data), 8-128 MiB, l = 2: 0 wrong for 4 x 8 MiB, 4 x 256K and 8 x 128K buffers, strict (3) and lookahead (7), on both this pipelined kernel and the original kernel (`optcc-serial-orig`, same net.cc).
+- The valve never fired after the registration fix.
+- The straggler really serves one peer at a time. On 4 x 256K, receive time with two or more peers on the wire at once falls from 9% to 0 (`prof_overlap.py`, instant share).
+
+**Results.** 64 MiB profiles (straggler span, bound 45.69 ms):
+
+| | off | strict | lookahead |
+|---|---|---|---|
+| original kernel, 4 x 256K | 48.48 +- 0.97 | 46.45 +- 0.10 | 46.32 +- 0.10 |
+| pipelined kernel, 4 x 256K | 46.85 +- 0.39 | 63.63 +- 0.34 | 64.43 +- 1.34 |
+| original kernel, k = 4 | 56.94 +- 1.42 | 84.18 +- 2.38 | 70.23 +- 4.96 |
+
+**The kernel has to be the original one.**
+- The original kernel runs a channel's segments strictly in turn, like the paper's patterns.
+- In the pipelined kernel, an ordering-2 channel's results for segment j come after its front(j+1), which needs the straggler's raw data of segment j+1.
+- The receive order puts B_j before A_{j+1}. So A waits with its data ready, and the link idles about 17 ms per direction at 64 MiB.
+
+**Timing** (4 rounds, original kernel, time / ring l = 1 of the same round):
+- 4 x 256K at 128 MiB:
+  - off 1.294 +- 0.019;
+  - strict 1.258 +- 0.003;
+  - lookahead 1.255 +- 0.005, i.e. 1.009 x the link bound;
+  - both p < 0.01 against off.
+- 4 x 256K at 64 MiB: 1.307 -> 1.264 / 1.256.
+- 8 x 128K at 128 MiB: 1.278 -> 1.264.
+- Coarse segments got slower (k = 4 at 128 MiB: 1.93 -> 2.21, p = 0.03): a late 4 MiB section idles the link for long.
+- The "off" numbers there profit from the pre-posting leak of the RX cap (DESIGN 4, T3b page). Serial mode posts one section at a time, which closes most of it.
+- 16 MiB: noisy, no gain; 8 x 128K strict is 15-27% slower (p about 0.06).
+- Lookahead helps only a little (the hand-over round trip is small next to head-of-line waits).
+
+**Status.** Correct and deadlock-free in every run so far (156 timed runs, no hang). Useful for 4 x 256K at 64 MiB and above; off by default.
