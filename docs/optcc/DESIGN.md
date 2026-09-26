@@ -342,3 +342,23 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 - Lookahead helps only a little (the hand-over round trip is small next to head-of-line waits).
 
 **Status.** Correct and deadlock-free in every run so far (156 timed runs, no hang). Useful for 4 x 256K at 64 MiB and above; off by default.
+
+## 8. RX cap: pace the hand-over to the GPU, not the posting (fix to 1 and 4)
+
+**Leak.** Entry 1 charged the bucket when an irecv was posted. Posting goes on while no data flows, so an idle receiver banks credit as outstanding receive buffers.
+- In the k = 4 runs (one segment per channel), the straggler waits about 17 ms for the first partial sums. In that time it posted 24-26 MiB of buffers.
+- The healthy senders then wrote into them at line rate: 14 MiB in the first 5 ms after the first byte, 23.5 Gbit/s against an 11.75 cap.
+- The staggered k = 4 run finished in 58.4 ms, below its own faithful bound of 62.4 ms (idle head + 64 MiB at the cap).
+- The shallow bucket of entry 4 does not help, because the credit sits in posted buffers, not in the bucket.
+- Fine segments are barely affected: their head is about 0.5 ms, so about 1 MiB gets pre-posted.
+
+**Fix** (`NCCL_NET_RX_PACE_DELIVER`, default 1; 0 restores entry 1).
+- Buffers are posted as upstream does.
+- A landed step is held from the GPU (recvTail) until the bucket has its bytes. The bucket keeps the same rate and depth: `NCCL_NET_RX_BURST_BYTES`, at least one step.
+- Data may still land early at line rate, but the kernel sees it at the cap. Idle time can bank at most the bucket depth.
+- A completed flush request is cleared at the hand-over, so it is never tested twice while the step waits.
+- The OptCC arbiter (entry 7) counts a receive section as done at the hand-over.
+
+**Why at the hand-over.** A real half-speed port backpressures the senders on the wire. The rig can only withhold credit, and credit can pile up while nothing flows. Pacing when data becomes usable is the closest observable: the receiver's kernel cannot run ahead of the cap. The senders' writes do complete earlier than on a real port, so a sender's own FIFO frees up sooner. It still cannot get further ahead than the receiver's posted buffers (4 slices per connection).
+
+**Profiler.** A receive step now has three times: landing (`RecvWait` end), hand-over (`RecvGpuWait` begin), and GPU done. `prof_timeline.py` counts a receive at the hand-over.
