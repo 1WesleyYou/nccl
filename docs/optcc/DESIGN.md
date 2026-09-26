@@ -3,7 +3,7 @@
 One entry per change: what it does, why it is built this way, what was
 rejected, how to turn it off. Newest last.
 
-## 1. Receive-side rate limit (`NCCL_NET_RX_MAX_MBPS`)
+## 1. Receive-side rate limit (`NCCL_NET_RX_MAX_MBPS`; removed, see 9)
 
 Branch `optcc-rxlimit`, file `src/transport/net.cc`.
 
@@ -156,7 +156,7 @@ Branch `optcc-kernel` (on top of `optcc-rxlimit`).
 - **Validation:** 80 of 80 runs clean with MPS on and default runtime connect, 64 MiB median 46.5 ms (unchanged). The chance of 0/80 at the old 4% rate is 0.96^80, about 4%.
 - **Logs:** `optcc results/20260925_rca/hang/` (DVC).
 
-## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
+## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1; removed, see 9)
 
 No code change; this fixes how entry 1 is used. `NCCL_NET_RX_BURST_BYTES`
 must stay near one grant plus a bandwidth-delay product. The rig uses
@@ -343,7 +343,7 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 
 **Status.** Correct and deadlock-free in every run so far (156 timed runs, no hang). Useful for 4 x 256K at 64 MiB and above; off by default.
 
-## 8. RX cap: pace the hand-over to the GPU, not the posting (fix to 1 and 4)
+## 8. RX cap: pace the hand-over to the GPU, not the posting (fix to 1 and 4; removed, see 9)
 
 **Leak.** Entry 1 charged the bucket when an irecv was posted. Posting goes on while no data flows, so an idle receiver banks credit as outstanding receive buffers.
 - In the k = 4 runs (one segment per channel), the straggler waits about 17 ms for the first partial sums. In that time it posted 24-26 MiB of buffers.
@@ -368,3 +368,27 @@ The paper instead starts C and D one "body" after A and B (Fig. 6). A body is th
 - The first 5 ms after the idle head: 13.4 Gbit/s (old 23.5). The rest above the cap is one 2 MiB step.
 - nccl-tests `-c 1` correct at 8–128 MiB, arbiter off and on.
 - Timing, 4 rounds, same-round A/B: the original kernel at k = 4 is 38% / 12% slower at 64 / 128 MiB, which is what the leak gave it. Fine segments move 0.4–2.5%. The best configuration (original kernel, `NCCL_OPTCC_SERIAL=7`, 4 x 256K) is 1.240x ring at 128 MiB, 1.005x the bound; k = 256 there, so the paper's (k+1)/k is 1.004.
+
+## 9. The receive cap leaves NCCL: netpace net plugin
+
+**Change.** The receive cap of entries 1, 4 and 8 (`NCCL_NET_RX_MAX_MBPS`,
+`NCCL_NET_RX_BURST_BYTES`, `NCCL_NET_RX_PACE_DELIVER`) is deleted from
+`src/transport/net.cc`. The OptCC rig caps receives with the netpace plugin
+instead (optcc repository, `netpace/`, branch `netpace`): an NCCL net plugin
+that links NCCL's own IB transport from this build's `libnccl_static.a` and
+holds a landed receive in `test()` until a FIFO link model of the cap has
+finished it. That is the hand-over pacing of entry 8, done outside NCCL.
+- `net.cc` now differs from upstream v2.28.7-1 only by the arbiter (entry 7).
+- The arbiter counts a receive section as done when the net reports its last
+  step received, `sub->received`; with the plugin that is the hand-over.
+- `NCCL_NET_RX_*` settings are ignored now. On the rig, `rank-env.sh` gives
+  each rank's `OPTCC_RX_MBPS` entry to the plugin as `NCCL_PACE_RX_MBPS`.
+
+**Why.** The emulation of a slow port does not belong in the library under
+test. With the plugin, NCCL runs unmodified apart from OptCC itself, and any
+NCCL-based baseline sees the same straggler. Measured before the removal
+(optcc `REPORT_NETPACE`): the plugin as a plain transport matched NCCL's
+internal IB within 0.3%; the plugin's cap matched this one within 1% for rings
+and fine segments; at k = 4 it was 2-6% slower, from its stricter burst (256
+KiB after idle, not a whole step), which is closer to a real port.
+
