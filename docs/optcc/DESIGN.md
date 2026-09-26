@@ -3,7 +3,7 @@
 One entry per change: what it does, why it is built this way, what was
 rejected, how to turn it off. Newest last.
 
-## 1. Receive-side rate limit (`NCCL_NET_RX_MAX_MBPS`)
+## 1. Receive-side rate limit (`NCCL_NET_RX_MAX_MBPS`; removed, see 9)
 
 Branch `optcc-rxlimit`, file `src/transport/net.cc`.
 
@@ -192,7 +192,7 @@ Test: `ra_diag OPTCC_PREKERNEL=1` (a device memset + sync + MPI barrier before t
 - The MPS server log (`/tmp/nvidia-mps-log/server.log` on node0) shows nothing during a hang. All clients go ACTIVE, and nothing is logged for the 45 s until the hunt kills the run.
 - The kernel log's Xid 31 MMU faults and MPS's "client encountered a fatal GPU error" appear at the kill (within 40 ms of the killed client's exit). They are a side effect of killing one client while its GPU neighbour still runs, not the cause.
 
-## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1)
+## 4. Receive cap fidelity: keep the bucket shallow (follow-up to 1; removed, see 9)
 
 No code change; this fixes how entry 1 is used. `NCCL_NET_RX_BURST_BYTES`
 must stay near one grant plus a bandwidth-delay product. The rig uses
@@ -249,3 +249,13 @@ and `USER_PROGRAMMABLE_CC=False`.
 Path, if wanted: `mstconfig set ROCE_CC_LEGACY_DCQCN=1` on both BF2s plus a
 portal power cycle, then a controller in the straggler's host that meters its
 VF's RX and sends CNPs. That is not doable unattended; the credit gate stays.
+
+## 9. The receive cap leaves NCCL: netpace net plugin
+
+This branch takes `src/transport/net.cc` from `optcc-serial` (the OptCC
+arbiter, entry 7 there). The receive cap of entries 1 and 4 (and of entry 8
+on `optcc-serial`) is deleted from it: the OptCC rig caps receives with the
+netpace net plugin (optcc repository, `netpace/`), which paces the hand-over
+of landed data to the GPU outside NCCL. `NCCL_NET_RX_*` settings are ignored.
+Details and the measurements behind the change: `optcc-serial`, DESIGN.md 9.
+
