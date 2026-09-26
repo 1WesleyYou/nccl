@@ -251,19 +251,23 @@ NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
 NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
 int64_t ncclParamOptccStraggler();
 
+struct optccArbOp {
+  std::map<std::pair<int, int>, struct ncclProxySubArgs*> subs;  // (channel, peer) -> sub
+  size_t expected = 0;                // channels x healthy peers
+};
 struct optccArbiter {
   explicit optccArbiter(bool s) : send(s) {}
   std::mutex mu;
   const bool send;                    // Stage 3 sends, or Stage 2 receives
   bool dead = false;                  // safety valve tripped
   bool announced = false;
-  std::map<uint64_t, std::map<std::pair<int, int>, struct ncclProxySubArgs*>> ops;  // opCount -> (channel, peer) -> sub
+  std::map<uint64_t, optccArbOp> ops; // by opCount; served in opCount order
   uint64_t cur = UINT64_MAX;          // opCount being served
   std::vector<int> order, healthy;
   int chunkSteps = 0, j = 0, q = 0, i = 0;  // loop, index into order, section
   uint64_t lastProg = UINT64_MAX;
   std::chrono::steady_clock::time_point since;
-  uint64_t sections = 0, held = 0;
+  uint64_t sections = 0;
 };
 static optccArbiter optccArbRecv(false), optccArbSend(true);
 
@@ -274,41 +278,49 @@ static bool optccArbOn(struct ncclProxyState* proxyState, struct ncclProxyArgs* 
   return proxyState->tpRank == straggler;
 }
 
-static void optccArbRegister(optccArbiter& a, struct ncclProxyArgs* args) {
+// The straggler's subs of one collective can arrive in several ProxyArgs, so
+// an op is served only once all its channels x healthy peers are registered.
+static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   std::lock_guard<std::mutex> lock(a.mu);
   if (!a.announced) {
     INFO(NCCL_INIT|NCCL_NET, "OptCC serial arbiter on for the straggler's %s", a.send ? "sends" : "receives");
     a.announced = true;
   }
-  auto& m = a.ops[args->opCount];
-  for (int s = 0; s < args->nsubs; s++) m[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
+  optccArbOp& op = a.ops[args->opCount];
+  op.expected = (size_t)args->nChannels * (size_t)(proxyState->tpnRanks - 1);
+  for (int s = 0; s < args->nsubs; s++) op.subs[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
   a.chunkSteps = args->chunkSteps;
 }
 
-// Drop an op's subs once its args completes (the proxy reuses the memory).
+// Drop an op's subs once their args completes (the proxy reuses the memory).
 static void optccArbRelease(optccArbiter& a, struct ncclProxyArgs* args) {
   std::lock_guard<std::mutex> lock(a.mu);
   auto it = a.ops.find(args->opCount);
   if (it == a.ops.end()) return;
-  for (auto s = it->second.begin(); s != it->second.end();) {
-    if (s->second >= args->subs && s->second < args->subs + args->nsubs) s = it->second.erase(s);
+  auto& m = it->second.subs;
+  for (auto s = m.begin(); s != m.end();) {
+    if (s->second >= args->subs && s->second < args->subs + args->nsubs) s = m.erase(s);
     else ++s;
   }
-  if (it->second.empty()) {
+  if (m.empty()) {
     if (a.cur == it->first) a.cur = UINT64_MAX;
     a.ops.erase(it);
   }
 }
 
+// Start serving the oldest op once it is fully registered (lock held).
 static void optccArbBegin(optccArbiter& a) {
-  a.cur = a.ops.empty() ? UINT64_MAX : a.ops.begin()->first;
+  a.cur = UINT64_MAX;
+  if (a.ops.empty()) return;
+  auto& first = *a.ops.begin();
+  if (first.second.subs.size() < first.second.expected) return;
+  a.cur = first.first;
   a.j = a.q = a.i = 0;
   a.order.clear();
   a.healthy.clear();
   a.lastProg = UINT64_MAX;
-  if (a.cur == UINT64_MAX) return;
   std::set<int> chs, peers;
-  for (auto& kv : a.ops[a.cur]) { chs.insert(kv.first.first); peers.insert(kv.first.second); }
+  for (auto& kv : first.second.subs) { chs.insert(kv.first.first); peers.insert(kv.first.second); }
   for (int pass = 0; pass < 2; pass++)          // receive: even then odd channels; send: odd then even
     for (int c : chs) if ((c % 2 == 0) == ((pass == 0) != a.send)) a.order.push_back(c);
   a.healthy.assign(peers.begin(), peers.end());
@@ -323,19 +335,25 @@ static bool optccArbHolder(optccArbiter& a, int* ch, int* peer) {
   return true;
 }
 
+static void optccArbNext(optccArbiter& a) {
+  a.sections++;
+  a.lastProg = UINT64_MAX;
+  if (++a.i == (int)a.healthy.size()) { a.i = 0; if (++a.q == (int)a.order.size()) { a.q = 0; a.j++; } }
+}
+
 // Move past finished sections (lock held).
 static void optccArbAdvance(optccArbiter& a) {
   for (int guard = 0; guard < 1 << 16; guard++) {
     if (a.cur == UINT64_MAX) { optccArbBegin(a); if (a.cur == UINT64_MAX) return; }
     auto op = a.ops.find(a.cur);
     int ch, peer;
-    if (op == a.ops.end() || !optccArbHolder(a, &ch, &peer)) { if (op != a.ops.end()) a.ops.erase(op); a.cur = UINT64_MAX; continue; }
+    if (op == a.ops.end() || !optccArbHolder(a, &ch, &peer)) { a.cur = UINT64_MAX; continue; }
     uint64_t lo = (uint64_t)a.j * a.chunkSteps;
     bool left = false;
-    for (auto& kv : op->second) if ((uint64_t)kv.second->nsteps > lo) { left = true; break; }
-    if (!left) { a.ops.erase(op); a.cur = UINT64_MAX; continue; }
-    auto it = op->second.find({ch, peer});
-    if (it == op->second.end()) return;          // that connection is not registered yet: wait
+    for (auto& kv : op->second.subs) if ((uint64_t)kv.second->nsteps > lo) { left = true; break; }
+    if (!left) { a.ops.erase(op); a.cur = UINT64_MAX; continue; }   // every section of this op was served
+    auto it = op->second.subs.find({ch, peer});
+    if (it == op->second.subs.end()) { optccArbNext(a); continue; }  // its args already completed
     struct ncclProxySubArgs* sub = it->second;
     uint64_t prog = a.send ? sub->done : sub->received;
     uint64_t end = std::min<uint64_t>(lo + a.chunkSteps, sub->nsteps);
@@ -349,9 +367,7 @@ static void optccArbAdvance(optccArbiter& a) {
       }
       return;
     }
-    a.sections++;
-    a.lastProg = UINT64_MAX;
-    if (++a.i == (int)a.healthy.size()) { a.i = 0; if (++a.q == (int)a.order.size()) { a.q = 0; a.j++; } }
+    optccArbNext(a);
   }
 }
 
@@ -362,10 +378,8 @@ static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct nccl
   optccArbAdvance(a);
   if (a.dead) return true;
   int ch, peer;
-  bool ok = args->opCount == a.cur && optccArbHolder(a, &ch, &peer) && sub->channelId == ch && sub->peer == peer &&
-            step >= (uint64_t)a.j * a.chunkSteps && step < (uint64_t)(a.j + 1) * a.chunkSteps;
-  if (!ok) a.held++;
-  return ok;
+  return args->opCount == a.cur && optccArbHolder(a, &ch, &peer) && sub->channelId == ch && sub->peer == peer &&
+         step >= (uint64_t)a.j * a.chunkSteps && step < (uint64_t)(a.j + 1) * a.chunkSteps;
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
@@ -1420,7 +1434,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       if (!sub->reg)
         sub->sendMhandle = resources->mhandles[args->protocol];
     }
-    if (optccArbOn(proxyState, args, true)) optccArbRegister(optccArbSend, args);
+    if (optccArbOn(proxyState, args, true)) optccArbRegister(optccArbSend, proxyState, args);
     args->state = ncclProxyOpProgress;
   }
   args->idle = 1;
@@ -1608,7 +1622,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       if (!sub->reg)
         sub->recvMhandle = resources->mhandles[args->protocol];
     }
-    if (optccArbOn(proxyState, args, false)) optccArbRegister(optccArbRecv, args);
+    if (optccArbOn(proxyState, args, false)) optccArbRegister(optccArbRecv, proxyState, args);
     args->state = ncclProxyOpProgress;
   }
   const bool arb = optccArbOn(proxyState, args, false);
