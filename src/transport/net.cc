@@ -343,8 +343,8 @@ static void optccArbAdvance(optccArbiter& a) {
       auto now = std::chrono::steady_clock::now();
       if (prog != a.lastProg) { a.lastProg = prog; a.since = now; }
       else if (now - a.since > std::chrono::milliseconds(ncclParamOptccSerialValveMs())) {
-        WARN("OptCC serial arbiter (%s): channel %d peer %d made no progress for %ld ms at step %lu/%d, switching the arbiter off",
-             a.send ? "send" : "recv", ch, peer, (long)ncclParamOptccSerialValveMs(), prog, sub->nsteps);
+        WARN("OptCC serial arbiter (%s): channel %d peer %d made no progress for %ld ms (posted %lu, received %lu, done %lu of %d steps, %lu sections served), switching the arbiter off",
+             a.send ? "send" : "recv", ch, peer, (long)ncclParamOptccSerialValveMs(), sub->posted, sub->received, sub->done, sub->nsteps, a.sections);
         a.dead = true;
       }
       return;
