@@ -259,3 +259,25 @@ netpace net plugin (optcc repository, `netpace/`), which paces the hand-over
 of landed data to the GPU outside NCCL. `NCCL_NET_RX_*` settings are ignored.
 Details and the measurements behind the change: `optcc-serial`, DESIGN.md 9.
 
+## 10. The straggler's S2 and S3 as separate stages (branch `optcc-serial-split`)
+
+**Problem.** For patterns A / C (ordering 1) the straggler ran S2 and S3 as one
+`recvReduceCopySend` per section: receive the partial, add its input, send
+the sum straight back. The arbiter (optcc-serial DESIGN.md 7) serves the
+straggler's sends in the paper's order B, D, A, C, so an A / C section could
+not be returned until B and D were done; its few send slots filled and the
+fused primitive stopped receiving. At k = 4, 64 MiB, the straggler's receive
+link was idle 42 ms of a 100 ms call.
+
+**Change.** The straggler receives every section of the segment first (S2,
+`recvReduceCopy` into the output) and returns them afterwards (S3,
+`sendFromOutput`), which is how the paper's schedule separates the two stages.
+Steps per connection are unchanged.
+
+**Effect** (optcc `diag/split_ab.sh`, 3 rounds, same rounds as the fused
+kernel). Profile at 64 MiB, arbiter lookahead: straggler span 99.8 -> 74.7 ms
+at k = 4 (receive gaps 42 -> 18 ms), 64.9 -> 59.8 ms at k = 8, 64.6 -> 60.9 ms
+at k = 12; sends overlap 3% of the time (fused 13%). Timing: up to 8-18% faster
+at coarse k with and without the arbiter (8 MiB k = 4 -8% / -18%, 128 MiB k = 16
+-9%, 128 MiB k = 12 without arbiter -17%), no significant slowdown.
+
