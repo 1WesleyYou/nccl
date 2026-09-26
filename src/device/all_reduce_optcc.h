@@ -88,7 +88,6 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
           link.sendFromOutput(off(hi), len(hi));
           if (bf) link.send(p2pOff, (int)p2pN);   // bubble: our raw block, right behind the section
           link.recv(off(hi), len(hi));
-          if (bf) link.recv(p2pOff, (int)p2pN);   // bubble: the block's global sum
         }
         {
           Prims ring(tid, nthreads, &prev, &next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
@@ -96,6 +95,11 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_
           ring.sendFromOutput(off(hi), len(hi));
           for (int j = 1; j < nh - 1; ++j) ring.recvCopySend(off(hi-j), len(hi-j));
           ring.recv(off(hi+1), len(hi+1));
+        }
+        if (bf) {  // bubble: the block's global sum, taken only after S4 so that it does not
+                   // hold up the allgather (it waits in the connection's buffer meanwhile)
+          Prims link(tid, nthreads, &S, &none, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+          link.recv(p2pOff, (int)p2pN);
         }
         if (ordering == 2) {  // S2 last: global sum to the straggler
           Prims link(tid, nthreads, &none, &S, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
