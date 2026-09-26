@@ -2028,6 +2028,7 @@ static ncclResult_t calcCollChunking(
   const bool ringSteps = info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_OPTCCRING;  // same ProtoSimple
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && ringSteps) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && ringSteps) ? info->sliceSteps : 1;
+  if (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_OPTCCRING) sliceSteps = chunkSteps;  // one slice per chunk, as the kernel
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
