@@ -112,6 +112,17 @@ class Primitives<
     // coverity[dead_error_line]
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
       int spins = 0;
+      /* 
+       *  Thread Local Spinning Lock:
+       *  For A -> B, A is RoleWaitSend && RolePostSend, A and B could be seen as sharing a buffer (although it's physically on B), and the buffer has a `head` and `tail` ptrs, head belongs to the reader (here is B) and tail belongs to writer A. 
+       *  A.step records how many buffers it has written (tail)
+       *  B.step records how many buffers it has read (head)
+       *  A.connStepCache records head (last time it recv update from B)
+       *  B.connStepCache records tail 
+       *  so the while logic below:
+       *  - For A, its: `head + NCCL_STEP < tail + StepPerSlice`, namely when A wants to write StepPerSlice slots, the head should be at least (tail + StepPerSlice - NCCL_STEP), for the window to exist.
+       *  - For B, its: `tail < head + StepPerSlice`, when B wants to read, the tail should be at least StepPerSlice ahead of head, otherwise there's no enough data for B to read.
+       */
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
         // a restriction that the consumer should not fall behind producer too much
         // the connStepCache is the current consumer ptr
