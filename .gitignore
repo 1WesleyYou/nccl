@@ -3,3 +3,6 @@
 /compile_commands.json
 *.gcov
 /coverage/
+
+# Editor setup is machine-local: never commit it.
+.vscode/
