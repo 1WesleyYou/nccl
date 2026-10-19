@@ -29,7 +29,7 @@
 
 // The l >= 2 - 1/(p-1) schedule (NCCL_OPTCC_BF_NUM = 0): this run() is the
 // kernel of branch optcc-serial-orig, unchanged.
-template<typename T, typename RedOp>
+template <typename T, typename RedOp>
 struct OptccRingOrig {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS/ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
@@ -111,7 +111,7 @@ struct OptccRingOrig {
 
 #include "all_reduce_optcc_bf.h"
 
-template<typename T, typename RedOp>
+template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_OPTCCRING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     if (ncclShmem.channel.optccRing.bfNum > 0) OptccRingBf<T, RedOp>().run(tid, nthreads, work);
