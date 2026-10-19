@@ -272,7 +272,14 @@ AllReduce of extra data through the straggler in those bubbles: every
 healthy rank uploads its raw block, the straggler adds the nh blocks to its
 own, and the sum goes back to every healthy rank one body later.
 
-**Mechanism (`src/device/all_reduce_optcc.h`).**
+**Files.** Two kernels side by side, chosen per collective by r:
+- `src/device/all_reduce_optcc.h`: `OptccRingOrig`, the kernel of
+  `optcc-serial-orig` with `run()` unchanged, for l >= 2 - 1/(p-1). It also
+  holds the `RunWorkColl` dispatch (r = 0: Orig, r > 0: Bf).
+- `src/device/all_reduce_optcc_bf.h`: `OptccRingBf`, the same schedule plus the
+  blocks below, for l under that.
+
+**Mechanism (`src/device/all_reduce_optcc_bf.h`).**
 - Layout: a loop keeps its size `nh x chunk` (so the proxy's loop count and
   `ncclCollCbdPart` are untouched). Its nh sections shrink to
   s' = loop / (nh + r), rounded down to 16 bytes, and the rest of the loop is
