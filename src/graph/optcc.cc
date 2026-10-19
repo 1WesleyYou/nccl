@@ -6,6 +6,8 @@
 #include <string>
 
 NCCL_PARAM(OptccStraggler, "OPTCC_STRAGGLER", 2);
+NCCL_PARAM(OptccBfNum, "OPTCC_BF_NUM", 0);
+NCCL_PARAM(OptccBfDen, "OPTCC_BF_DEN", 1);
 int ncclOptccStraggler() { return (int)ncclParamOptccStraggler(); }
 
 bool ncclOptccRequested() {
@@ -30,6 +32,12 @@ ncclResult_t ncclBuildOptccRings(int nChannels, const int* rings, struct ncclCom
   const int nHealthyRanks = nranks-nStragglers;
   if (nHealthyRanks <= 0) return ncclInvalidArgument;
   const bool localIsStraggler = isStraggler(stragglerRanks, nStragglers, comm->rank);
+  // Bubble filling: r = NUM / DEN in [0, 1] (a block is at most one chunk).
+  const int bfNum = (int)ncclParamOptccBfNum(), bfDen = (int)ncclParamOptccBfDen();
+  if (bfNum < 0 || bfDen <= 0 || bfNum > bfDen) {
+    WARN("NCCL_OPTCC_BF_NUM / NCCL_OPTCC_BF_DEN = %d / %d: need 0 <= NUM <= DEN, DEN > 0", bfNum, bfDen);
+    return ncclInvalidArgument;
+  }
 
   for (int c=0; c<nChannels; c++) {
     struct ncclOptccRing* optcc = &comm->channels[c].optccRing;
@@ -39,6 +47,8 @@ ncclResult_t ncclBuildOptccRings(int nChannels, const int* rings, struct ncclCom
     optcc->ringPrev = optcc->ringNext = -1;
     optcc->straggler = nStragglers > 0 ? stragglerRanks[0] : -1;
     optcc->healthyIndex = -1;
+    optcc->bfNum = bfNum;
+    optcc->bfDen = bfDen;
     {
       // Canonical healthy order: this channel's ring, rotated to start at its lowest rank.
       const int* ord = rings+c*nranks;

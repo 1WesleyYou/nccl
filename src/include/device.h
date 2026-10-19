@@ -194,6 +194,9 @@ struct ncclOptccRing {
   int straggler;
   int healthyIndex;
   int healthy[NCCL_OPTCC_MAX_HEALTHY];
+  // Bubble filling for l < 2 (NCCL_OPTCC_BF_NUM / _DEN = r, block / section;
+  // 0 = off). See all_reduce_optcc.h.
+  int bfNum, bfDen;
 };
 
 // The root of each tree only has one node down (+1 intra-node).

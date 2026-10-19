@@ -187,8 +187,8 @@ NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 // a NIC carry one flow at a time. OptccRing's channels run independently, so
 // without this the straggler's NIC serves several healthy peers at once. With
 // it, the straggler's proxy offers receive buffers (and issues sends) for one
-// (channel, healthy peer) section at a time, in fixed orders taken from the
-// paper's schedule:
+// (channel, healthy peer) section at a time (with bubble filling, a section
+// and its block), in fixed orders taken from the paper's schedule:
 //   receive (Stage 2): per loop, ordering-1 channels (A, C) then ordering-2 (B, D);
 //   send    (Stage 3): per loop, ordering-2 channels (B, D) then ordering-1 (A, C);
 // inside a channel, the kernel's section order (healthy index 0..nh-1; an
@@ -205,6 +205,7 @@ NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
 NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
 int64_t ncclParamOptccStraggler();
+int64_t ncclParamOptccBfNum();
 
 struct optccArbOp {
   std::map<std::pair<int, int>, struct ncclProxySubArgs*> subs;  // (channel, peer) -> sub
@@ -219,7 +220,7 @@ struct optccArbiter {
   std::map<uint64_t, optccArbOp> ops; // by opCount; served in opCount order
   uint64_t cur = UINT64_MAX;          // opCount being served
   std::vector<int> order, healthy;
-  int chunkSteps = 0, j = 0, q = 0, i = 0;  // loop, index into order, section
+  int chunkSteps = 0, j = 0, q = 0, i = 0;  // steps of one flow; loop, index into order, section
   uint64_t lastProg = UINT64_MAX;
   std::chrono::steady_clock::time_point since;
   uint64_t sections = 0;
@@ -244,7 +245,9 @@ static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState,
   optccArbOp& op = a.ops[args->opCount];
   op.expected = (size_t)args->nChannels * (size_t)(proxyState->tpnRanks - 1);
   for (int s = 0; s < args->nsubs; s++) op.subs[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
-  a.chunkSteps = args->chunkSteps;
+  // One flow per (channel, peer) and loop: a section, plus the block behind it
+  // with bubble filling (NCCL_OPTCC_BF_NUM > 0), served without a hand-over.
+  a.chunkSteps = args->chunkSteps * (ncclParamOptccBfNum() > 0 ? 2 : 1);
 }
 
 // Drop an op's subs once their args completes (the proxy reuses the memory).

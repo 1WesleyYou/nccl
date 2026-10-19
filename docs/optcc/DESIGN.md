@@ -259,3 +259,59 @@ netpace net plugin (optcc repository, `netpace/`), which paces the hand-over
 of landed data to the GPU outside NCCL. `NCCL_NET_RX_*` settings are ignored.
 Details and the measurements behind the change: `optcc-serial`, DESIGN.md 9.
 
+
+## 12. Bubble filling for l < 2 on the original kernel (branch `optcc-orig-bf`)
+
+**Use.** `NCCL_OPTCC_BF_NUM` / `NCCL_OPTCC_BF_DEN` = r, the P2P block's size
+relative to a section, in [0, 1]. 0 (default) is the kernel of entry 2,
+unchanged. The paper's value is r = (2 - l) / l (1/3 at l = 1.5).
+
+**What it is.** Paper Sec. 4.2, Fig. 7 and App. C: at l < 2 a straggler flow
+(l s) is shorter than its ring slot (2 s). The filling runs a centralized
+AllReduce of extra data through the straggler in those bubbles: every
+healthy rank uploads its raw block, the straggler adds the nh blocks to its
+own, and the sum goes back to every healthy rank one body later.
+
+**Mechanism (`src/device/all_reduce_optcc.h`).**
+- Layout: a loop keeps its size `nh x chunk` (so the proxy's loop count and
+  `ncclCollCbdPart` are untouched). Its nh sections shrink to
+  s' = loop / (nh + r), rounded down to 16 bytes, and the rest of the loop is
+  the block. A channel's last loop has no block.
+- Every straggler flow is two chunks, on the connection OptCC already
+  connects at init (no new connection):
+  - S2 (healthy -> straggler), loop j: the section, then the raw block j.
+  - S3 (straggler -> healthy), loop j: the section, then the sum of block
+    j - 1 (empty in loop 0). This is the paper's "body b uploads, body b + 1
+    broadcasts".
+- Both orderings are filled (patterns A / C and B / D), so every straggler
+  connection moves exactly 2 chunks per loop in each direction. The proxy
+  doubles `nsteps` on those connections, and the arbiter serves a
+  (channel, peer) flow as 2 chunkSteps.
+- The healthy rank takes the block's sum at the very end of its loop, not
+  right after the section, so it never holds up S1 / S4 (the lesson of
+  `optcc-serial-bf` ae66d607). Meanwhile it waits in the connection buffer:
+  section + block = 2 chunks = NCCL_STEPS steps.
+- The straggler sums the blocks in its output buffer. The first block is
+  added to its input, the later ones to the running sum.
+- A primitive call moves at most one chunk, so a block that rounding pushes
+  past one chunk (tiny chunks only) turns filling off for that loop.
+
+**Choosing r.** The paper's r makes a filled straggler flow exactly 2 s',
+because its slot model leaves a healthy NIC idle while it waits on the
+straggler. Our channels run concurrently, so a healthy NIC never idles
+(measured r = 0 is 1.098 T0 against the fluid 1.094 T0). In that fluid
+model, per segment a healthy NIC sends (2p - 3) + r sections and the
+straggler's link is busy l (p - 1)(1 + r). The two balance at
+r* = ((2p - 3) - l (p - 1)) / (l (p - 1) - 1): 0.2 at p = 5, l = 1.5, which
+gives exactly the Theorem 1 bound 2l(p - 1) / (l(p - 1) + 1) n. The paper's
+r = 1/3 overloads the straggler instead: 1.846 n vs 1.75 n unfilled. This is
+why fill v1 / v2 on `optcc-serial-bf` were 0.2-10 % slower.
+
+**Rejected.** Returning the block's sum in the same loop. On ordering 1 the
+straggler would have to wait for all nh blocks before its first return, and
+on ordering 2 its S3 comes before the uploads.
+
+**Checks.** froot, 5 ranks with distinct `NCCL_HOSTID` (Socket over lo),
+nccl-tests `-c 1`. Run for r in {0, 1/5, 1/3, 1}, straggler 3 and 0, arbiter
+on and off, 8 KiB-64 MiB, plus an uneven size, half and max. Results:
+`optcc-notes/20261018_l15_bubble_fill/`.

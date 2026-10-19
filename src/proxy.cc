@@ -608,15 +608,18 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       struct ncclOptccRing* oc = &channel->optccRing;
       struct ncclProxyOp ringOp = *op;
       ringOp.nsteps = op->nsteps * 2 * (oc->nHealthyRanks - 1);
+      // Bubble filling: every straggler flow is the section and then a block.
+      struct ncclProxyOp linkOp = *op;
+      if (oc->bfNum > 0) linkOp.nsteps = op->nsteps * 2;
       if (oc->healthyIndex >= 0) {
         NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->ringPrev, &ringOp, 0, justInquire));
         NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->ringNext, &ringOp, 0, justInquire));
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, op, 0, justInquire));
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, op, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, &linkOp, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, &linkOp, 0, justInquire));
       } else {
         for (int i=0; i<oc->nHealthyRanks; i++) {
-          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], op, 0, justInquire));
-          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], op, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], &linkOp, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], &linkOp, 0, justInquire));
         }
       }
     } break;
