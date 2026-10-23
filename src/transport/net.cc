@@ -202,8 +202,14 @@ NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 // Safety valve: no progress on the current flow for NCCL_OPTCC_SERIAL_VALVE_MS
 // (default 5 s, well above the skew between ranks entering their first
 // collective) switches the arbiter off, with a warning, for the rest of the process.
+// Timed hand-over (NCCL_OPTCC_SERIAL_LEAD_US >= 0, send side only): the next
+// section may start LEAD_US before the current one is expected to finish, the
+// expectation being the measured duration of the last finished section (first
+// issue to last step done). Until one section has finished it waits for done,
+// as without lookahead. LEAD_US = 0 ~ bit 2 off; LEAD_US >= a section ~ bit 2.
 NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
 NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
+NCCL_PARAM(OptccSerialLeadUs, "OPTCC_SERIAL_LEAD_US", -1);
 int64_t ncclParamOptccStraggler();
 int64_t ncclParamOptccBfNum();
 
@@ -224,6 +230,10 @@ struct optccArbiter {
   uint64_t lastProg = UINT64_MAX;
   std::chrono::steady_clock::time_point since;
   uint64_t sections = 0;
+  // timed hand-over: when the current / next section first issued, last section's duration
+  bool curStarted = false, nextStarted = false;
+  std::chrono::steady_clock::time_point curStart, nextStart;
+  int64_t secNs = -1;
 };
 static optccArbiter optccArbRecv(false), optccArbSend(true);
 
@@ -239,7 +249,8 @@ static bool optccArbOn(struct ncclProxyState* proxyState, struct ncclProxyArgs* 
 static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   std::lock_guard<std::mutex> lock(a.mu);
   if (!a.announced) {
-    INFO(NCCL_INIT|NCCL_NET, "OptCC serial arbiter on for the straggler's %s", a.send ? "sends" : "receives");
+    INFO(NCCL_INIT|NCCL_NET, "OptCC serial arbiter on for the straggler's %s (lead %ld us)", a.send ? "sends" : "receives",
+         (long)ncclParamOptccSerialLeadUs());
     a.announced = true;
   }
   optccArbOp& op = a.ops[args->opCount];
@@ -274,6 +285,7 @@ static void optccArbBegin(optccArbiter& a) {
   if (first.second.subs.size() < first.second.expected) return;
   a.cur = first.first;
   a.j = a.q = a.i = 0;
+  a.curStarted = a.nextStarted = false;
   a.order.clear();
   a.healthy.clear();
   a.lastProg = UINT64_MAX;
@@ -294,6 +306,11 @@ static bool optccArbHolder(optccArbiter& a, int* ch, int* peer) {
 }
 
 static void optccArbNext(optccArbiter& a) {
+  if (a.curStarted)
+    a.secNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a.curStart).count();
+  a.curStarted = a.nextStarted;
+  a.curStart = a.nextStart;
+  a.nextStarted = false;
   a.sections++;
   a.lastProg = UINT64_MAX;
   if (++a.i == (int)a.healthy.size()) { a.i = 0; if (++a.q == (int)a.order.size()) { a.q = 0; a.j++; } }
@@ -335,6 +352,8 @@ static void optccArbAdvance(optccArbiter& a) {
 // current section's last step instead of idling the link.
 static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct ncclProxySubArgs* sub, uint64_t step) {
   static const bool lookahead = ncclParamOptccSerial() & 4;
+  static const int64_t leadUs = ncclParamOptccSerialLeadUs();
+  const bool timed = a.send && leadUs >= 0;
   std::lock_guard<std::mutex> lock(a.mu);
   if (a.dead) return true;
   optccArbAdvance(a);
@@ -342,20 +361,29 @@ static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct nccl
   int ch, peer;
   if (!optccArbHolder(a, &ch, &peer)) return false;
   uint64_t lo = (uint64_t)a.j * a.chunkSteps;
-  if (sub->channelId == ch && sub->peer == peer) return step >= lo && step < lo + a.chunkSteps;
-  if (!lookahead) return false;
+  auto now = std::chrono::steady_clock::now();
+  if (sub->channelId == ch && sub->peer == peer) {
+    bool ok = step >= lo && step < lo + a.chunkSteps;
+    if (ok && !a.curStarted) { a.curStarted = true; a.curStart = now; }
+    return ok;
+  }
+  if (!lookahead && !timed) return false;
   auto op = a.ops.find(a.cur);
   auto it = op->second.subs.find({ch, peer});
   if (it != op->second.subs.end()) {
     uint64_t issued = a.send ? it->second->transmitted : it->second->posted;
     if (issued < std::min<uint64_t>(lo + a.chunkSteps, it->second->nsteps)) return false;
   }
+  if (timed && (!a.curStarted || a.secNs < 0 || now < a.curStart + std::chrono::nanoseconds(a.secNs - leadUs * 1000)))
+    return false;
   int j = a.j, q = a.q, i = a.i;                 // the section after the current one
   if (++i == (int)a.healthy.size()) { i = 0; if (++q == (int)a.order.size()) { q = 0; j++; } }
   int c = a.order[q], nh = (int)a.healthy.size();
   int p = a.healthy[(a.send && c % 2 == 1) ? (i + 1) % nh : i];
   uint64_t lo2 = (uint64_t)j * a.chunkSteps;
-  return sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + a.chunkSteps;
+  bool ok = sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + a.chunkSteps;
+  if (ok && !a.nextStarted) { a.nextStarted = true; a.nextStart = now; }
+  return ok;
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
