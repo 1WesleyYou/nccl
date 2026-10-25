@@ -12,9 +12,9 @@
  *   - healthy: section to the straggler (connIndex 0), then its raw block j
  *     (connIndex 1); at the end of the loop, the sum of block j-1 (connIndex 1);
  *   - straggler: all nh section exchanges first (connIndex 0, healthy order),
- *     then the sums of block j-1 back, then this loop's nh raw blocks added
- *     into its own (connIndex 1). Block traffic fills the time the straggler
- *     waits for the next loop's sections; a block's sum is needed only then.
+ *     then the previous loop's nh raw blocks added into its own and their sum
+ *     back (connIndex 1). Blocks arrive while the straggler serves sections,
+ *     so neither the next loop's sections nor this reduction wait on them.
  *
  * A loop is nh full sections (one chunk each, like OptccRingOrig) plus a
  * block of r chunks (r = NUM / DEN <= 1, ncclOptccBlkCount; the host's loop
@@ -57,7 +57,16 @@ struct OptccRingBf {
     // Block of the previous loop, whose sum this loop returns.
     ssize_t prevOff = gridOffset;
     int prevN = 0;
-    // Straggler: the previous block's sum back to each healthy rank (connIndex 1).
+    // Straggler: the previous loop's raw blocks of every healthy rank added
+    // into ours (the first from the input, the rest onto the running sum in
+    // the output), then that sum back to each healthy rank (connIndex 1).
+    auto reduceBlocks = [&] __device__() {
+      for (int i = 0; i < nh; ++i) {
+        int h = oc->healthy[i];
+        Prims q(tid, nthreads, &h, &none, i == 0 ? in : out, out, work->redOpArg, 0, 1, 0, work);
+        q.recvReduceCopy(prevOff, prevOff, prevN);
+      }
+    };
     auto sendSums = [&] __device__() {
       for (int i = 0; i < nh; ++i) {  // ordering 2: to the rank that starts section i's chain
         int h = ordering == 1 ? oc->healthy[i] : oc->healthy[mod(i + 1)];
@@ -129,36 +138,32 @@ struct OptccRingBf {
         }
       } else {
         // ---- straggler: the sections first, one flow at a time in healthy order
-        // (the arbiter's order); then the previous block's sum, ready since the
-        // last loop, back to each healthy rank; then this loop's blocks, which
-        // are needed only a loop later, while the straggler waits for the next
-        // sections. Sections on connIndex 0, block traffic on connIndex 1.
+        // (the arbiter's order); then the previous loop's blocks, reduced and
+        // their sum sent back. Sections on connIndex 0, block traffic on
+        // connIndex 1.
         if (ordering == 1) {
           for (int i = 0; i < nh; ++i) {  // S2 + S3: partial of section i in, + our input, result back
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &h, &h, in, out, work->redOpArg, 0, 0, 0, work);
             p.recvReduceCopySend(off(i), off(i), len(i));
           }
-          if (!first) sendSums();
         } else {
           for (int i = 0; i < nh; ++i) {  // S3: raw section i to the rank that starts its chain
             int starter = oc->healthy[mod(i + 1)];
             Prims p(tid, nthreads, &none, &starter, in, out, work->redOpArg, 0, 0, 0, work);
             p.send(off(i), len(i));
           }
-          if (!first) sendSums();
           for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &h, &none, in, out, work->redOpArg, 0, 0, 0, work);
             p.recv(off(i), len(i));
           }
         }
-        // Each healthy rank's raw block added into ours: the first from the
-        // input, the rest onto the running sum in the output.
-        for (int i = 0; i < nh; ++i) {
-          int h = oc->healthy[i];
-          Prims q(tid, nthreads, &h, &none, i == 0 ? in : out, out, work->redOpArg, 0, 1, 0, work);
-          q.recvReduceCopy(blkOff, blkOff, blkN);
+        // The previous loop's blocks: they arrived during this loop's sections,
+        // and the next loop's sections never wait on their reduction.
+        if (!first) {
+          reduceBlocks();
+          sendSums();
         }
       }
       prevOff = blkOff;
@@ -169,6 +174,7 @@ struct OptccRingBf {
       Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
       link.recv(prevOff, prevN);
     } else {
+      reduceBlocks();
       sendSums();
     }
   }
