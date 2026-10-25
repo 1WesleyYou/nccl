@@ -10,7 +10,7 @@
  * own buffers, FIFO and QPs, and outside the straggler's SERIAL arbiter, so a
  * block never queues in front of a section.
  *   - healthy: section to the straggler (connIndex 0), then its raw block j
- *     (connIndex 1); at the end of the loop, the sum of block j-1 (connIndex 1);
+ *     (connIndex 1); at the end of the loop, the sum of block j-2 (connIndex 1);
  *   - straggler: all nh section exchanges first (connIndex 0, healthy order;
  *     on ordering 2 the raw sections go out a loop ahead), then the previous
  *     loop's nh raw blocks added into its own and their sum back (connIndex 1). Blocks arrive while the straggler serves sections,
@@ -19,8 +19,9 @@
  * A loop is nh full sections (one chunk each, like OptccRingOrig) plus a
  * block of r chunks (r = NUM / DEN <= 1, ncclOptccBlkCount; the host's loop
  * count uses the same size). A short last loop shares out what is left: equal
- * sections, and a block only past nh full ones. Loop j returns the sum of block
- * j-1, and a flush after the last loop returns the last one.
+ * sections, and a block only past nh full ones. The straggler returns the sum
+ * of block j-1 in loop j and the last one in a flush; a healthy rank takes it
+ * a loop later (block j-2 at the end of loop j, the last two in the flush).
  *
  * A primitive call always moves its connections by one chunk, even when empty.
  * Per loop and connection the chunk counts match ncclProxySaveOp's
@@ -54,9 +55,12 @@ struct OptccRingBf {
     const ssize_t loopCount = nh * sec0 + blkMax;
     const ssize_t align = 16 / sizeof(T);
     auto mod = [&] __device__(int j) -> int { return ((j % nh) + nh) % nh; };
-    // Block of the previous loop, whose sum this loop returns.
-    ssize_t prevOff = gridOffset;
-    int prevN = 0;
+    // Block of the previous loop, whose sum the straggler returns this loop, and
+    // the one before it, whose sum a healthy rank takes at the end of this loop
+    // (a loop late, so it never waits on the straggler's block reduction; the
+    // connIndex 1 FIFO holds the two outstanding sums).
+    ssize_t prevOff = gridOffset, prev2Off = gridOffset;
+    int prevN = 0, prev2N = 0;
     // Straggler: the previous loop's raw blocks of every healthy rank added
     // into ours (the first from the input, the rest onto the running sum in
     // the output), then that sum back to each healthy rank (connIndex 1).
@@ -150,9 +154,9 @@ struct OptccRingBf {
           Prims blk(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 1, work);
           blk.send(blkOff, blkN);
         }
-        if (!first) {  // the previous block's sum
+        if (elemOffset >= 2 * loopCount) {  // the sum of the block two loops back
           Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
-          link.recv(prevOff, prevN);
+          link.recv(prev2Off, prev2N);
         }
       } else {
         // ---- straggler: the sections first, one flow at a time in healthy order
@@ -181,12 +185,16 @@ struct OptccRingBf {
           sendSums();
         }
       }
+      prev2Off = prevOff;
+      prev2N = prevN;
       prevOff = blkOff;
       prevN = blkN;
     }
-    // Flush: the last block's sum.
+    // Flush: the sums still outstanding (the last two blocks; one with a
+    // single loop).
     if (hi >= 0) {
       Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
+      if (channelCount > loopCount) link.recv(prev2Off, prev2N);
       link.recv(prevOff, prevN);
     } else {
       reduceBlocks();
