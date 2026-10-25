@@ -5,15 +5,16 @@
  *
  * The schedule is OptccRingOrig's (all_reduce_optcc.h): four stages per
  * segment, ordering 1 on even channels and ordering 2 on odd ones. On top of
- * it, every straggler flow carries one more chunk, a block of a
- * point-to-point AllReduce through the straggler:
- *   - loop j's S2 flow (healthy -> straggler) is the section, then this rank's
- *     raw block j; the straggler adds the nh blocks to its own;
- *   - loop j+1's S3 flow (straggler -> healthy) is the section, then the sum
- *     of block j (the paper's "body b uploads, body b+1 broadcasts back").
- * The healthy rank takes that sum only at the end of its loop, so it never
- * holds up S1 / S4. Until then the sum waits in the connection buffer
- * (section + block = 2 chunks = NCCL_STEPS steps).
+ * it, a point-to-point AllReduce of one block per segment through the
+ * straggler, on its own connection (connIndex 1, ncclTransportOptccConnect):
+ * own buffers, FIFO and QPs, and outside the straggler's SERIAL arbiter, so a
+ * block never queues in front of a section.
+ *   - healthy: section to the straggler (connIndex 0), then its raw block j
+ *     (connIndex 1); at the end of the loop, the sum of block j-1 (connIndex 1);
+ *   - straggler: all nh section exchanges first (connIndex 0, healthy order),
+ *     then the sums of block j-1 back, then this loop's nh raw blocks added
+ *     into its own (connIndex 1). Block traffic fills the time the straggler
+ *     waits for the next loop's sections; a block's sum is needed only then.
  *
  * A loop keeps its size, so the proxy's loop count holds. Its sections shrink
  * to s' = loop / (nh + r) and the block is the rest (r = NUM / DEN, block /
@@ -23,8 +24,9 @@
  * A primitive call always moves its connections by one chunk, even when empty.
  * Per loop and connection the chunk counts match ncclProxySaveOp's
  * ncclPatternOptcc case:
- *   healthy: 2(nh-1) to next / from prev; 2 to / 2 from the straggler;
- *   straggler: 2 to / 2 from each healthy rank.
+ *   healthy: 2(nh-1) to next / from prev; 1 to / 1 from the straggler on each
+ *            of connIndex 0 and 1;
+ *   straggler: 1 to / 1 from each healthy rank on each of connIndex 0 and 1.
  ************************************************************************/
 
 template <typename T, typename RedOp>
@@ -76,6 +78,9 @@ struct OptccRingBf {
       auto off = [&] __device__(int j) -> ssize_t { return gridOffset + elemOffset + (ssize_t)mod(j) * sec; };
       auto len = [&] __device__(int j) -> int { return (int)min(sec, remCount - (ssize_t)mod(j) * sec); };
 
+      // Primitives(..., group, connIndexRecv, connIndexSend, work): sections on
+      // connIndex 0, the blocks and their sums on connIndex 1 (own buffers, FIFO
+      // and QPs, outside the straggler's arbiter).
       if (hi >= 0) {
         // ---- healthy rank ----
         if (ordering == 2) {  // S3 + first hop of S1: straggler's raw section (hi-1) + ours -> next
@@ -90,10 +95,16 @@ struct OptccRingBf {
           ring.recvReduceCopy(off(hi), off(hi), len(hi));  // ordering 2: already the global sum
         }
         if (ordering == 1) {  // S2 + S3: partial up, global sum back into our section
-          Prims link(tid, nthreads, &S, &S, in, out, work->redOpArg, 0, 0, 0, work);
-          link.sendFromOutput(off(hi), len(hi));
-          link.send(blkOff, blkN);  // our raw block, right behind the section
-          link.recv(off(hi), len(hi));
+          {
+            Prims up(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 0, work);
+            up.sendFromOutput(off(hi), len(hi));
+          }
+          {  // our raw block, on its own connection
+            Prims blk(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 1, work);
+            blk.send(blkOff, blkN);
+          }
+          Prims down(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 0, 0, work);
+          down.recv(off(hi), len(hi));
         }
         {
           Prims ring(tid, nthreads, &prev, &next, in, out, work->redOpArg, 0, 0, 0, work);
@@ -103,51 +114,56 @@ struct OptccRingBf {
           ring.recv(off(hi + 1), len(hi + 1));
         }
         if (ordering == 2) {  // S2 last: global sum to the straggler, then our raw block
-          Prims link(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 0, work);
-          link.sendFromOutput(off(hi), len(hi));
-          link.send(blkOff, blkN);
+          {
+            Prims up(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 0, work);
+            up.sendFromOutput(off(hi), len(hi));
+          }
+          Prims blk(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 1, work);
+          blk.send(blkOff, blkN);
         }
-        {  // the previous block's sum, which followed this loop's S3 section
-          Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 0, 0, work);
+        {  // the previous block's sum
+          Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
           link.recv(prevOff, prevN);
         }
       } else {
-        // ---- straggler: one flow at a time, in healthy order ----
-        for (int i = 0; i < nh; ++i) {
-          int h = oc->healthy[i];
-          if (ordering == 1) {  // partial of section i in, + our input, result back
-            {
-              Prims p(tid, nthreads, &h, &h, in, out, work->redOpArg, 0, 0, 0, work);
-              p.recvReduceCopySend(off(i), off(i), len(i));
-              if (i == 0) p.recvReduceCopy(blkOff, blkOff, blkN);  // block: ours + the first
-            }
-            {
-              // Later blocks add to the running sum in the output; then the
-              // previous block's sum follows the section back.
-              Prims q(tid, nthreads, &h, &h, out, out, work->redOpArg, 0, 0, 0, work);
-              if (i > 0) q.recvReduceCopy(blkOff, blkOff, blkN);
-              q.sendFromOutput(prevOff, prevN);
-            }
-          } else {  // S3: raw section i to the rank that starts its chain, healthy index i+1
+        // ---- straggler: the sections first, one flow at a time in healthy order
+        // (the arbiter's order); then the previous block's sum, ready since the
+        // last loop, back to each healthy rank; then this loop's blocks, which
+        // are needed only a loop later, while the straggler waits for the next
+        // sections. Sections on connIndex 0, block traffic on connIndex 1.
+        auto sendSums = [&] __device__() {
+          for (int i = 0; i < nh; ++i) {  // ordering 2: to the rank that starts section i's chain
+            int h = ordering == 1 ? oc->healthy[i] : oc->healthy[mod(i + 1)];
+            Prims q(tid, nthreads, &none, &h, out, out, work->redOpArg, 0, 0, 1, work);
+            q.sendFromOutput(prevOff, prevN);
+          }
+        };
+        if (ordering == 1) {
+          for (int i = 0; i < nh; ++i) {  // S2 + S3: partial of section i in, + our input, result back
+            int h = oc->healthy[i];
+            Prims p(tid, nthreads, &h, &h, in, out, work->redOpArg, 0, 0, 0, work);
+            p.recvReduceCopySend(off(i), off(i), len(i));
+          }
+          sendSums();
+        } else {
+          for (int i = 0; i < nh; ++i) {  // S3: raw section i to the rank that starts its chain
             int starter = oc->healthy[mod(i + 1)];
             Prims p(tid, nthreads, &none, &starter, in, out, work->redOpArg, 0, 0, 0, work);
             p.send(off(i), len(i));
-            p.sendFromOutput(prevOff, prevN);  // the previous block's sum behind it
+          }
+          sendSums();
+          for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
+            int h = oc->healthy[i];
+            Prims p(tid, nthreads, &h, &none, in, out, work->redOpArg, 0, 0, 0, work);
+            p.recv(off(i), len(i));
           }
         }
-        if (ordering == 2) {
-          for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner, then its block
-            int h = oc->healthy[i];
-            {
-              Prims p(tid, nthreads, &h, &none, in, out, work->redOpArg, 0, 0, 0, work);
-              p.recv(off(i), len(i));
-              if (i == 0) p.recvReduceCopy(blkOff, blkOff, blkN);
-            }
-            if (i > 0) {
-              Prims q(tid, nthreads, &h, &none, out, out, work->redOpArg, 0, 0, 0, work);
-              q.recvReduceCopy(blkOff, blkOff, blkN);
-            }
-          }
+        // Each healthy rank's raw block added into ours: the first from the
+        // input, the rest onto the running sum in the output.
+        for (int i = 0; i < nh; ++i) {
+          int h = oc->healthy[i];
+          Prims q(tid, nthreads, &h, &none, i == 0 ? in : out, out, work->redOpArg, 0, 1, 0, work);
+          q.recvReduceCopy(blkOff, blkOff, blkN);
         }
       }
       prevOff = blkOff;

@@ -237,6 +237,13 @@ struct optccArbiter {
 };
 static optccArbiter optccArbRecv(false), optccArbSend(true);
 
+// Bubble filling moves its blocks on connIndex 1 (ncclTransportOptccConnect); the
+// arbiter orders only the sections, on connIndex 0, and lets the blocks through.
+static bool optccArbSection(struct ncclProxySubArgs* sub, bool send) {
+  void* r = sub->connection->transportResources;
+  return (send ? ((struct sendNetResources*)r)->connIndex : ((struct recvNetResources*)r)->connIndex) == 0;
+}
+
 static bool optccArbOn(struct ncclProxyState* proxyState, struct ncclProxyArgs* args, bool send) {
   static const int64_t mode = ncclParamOptccSerial();
   if (!(mode & (send ? 2 : 1)) || args->pattern != ncclPatternOptcc) return false;
@@ -255,10 +262,11 @@ static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState,
   }
   optccArbOp& op = a.ops[args->opCount];
   op.expected = (size_t)args->nChannels * (size_t)(proxyState->tpnRanks - 1);
-  for (int s = 0; s < args->nsubs; s++) op.subs[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
-  // One flow per (channel, peer) and loop: a section, plus the block behind it
-  // with bubble filling (NCCL_OPTCC_BF_NUM > 0), served without a hand-over.
-  a.chunkSteps = args->chunkSteps * (ncclParamOptccBfNum() > 0 ? 2 : 1);
+  for (int s = 0; s < args->nsubs; s++)
+    if (optccArbSection(args->subs + s, a.send)) op.subs[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
+  // One flow per (channel, peer) and loop: a section. Bubble-filling blocks run
+  // on their own connection (connIndex 1), outside the arbiter.
+  a.chunkSteps = args->chunkSteps;
 }
 
 // Drop an op's subs once their args completes (the proxy reuses the memory).
@@ -1522,7 +1530,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               assert(sendSize == size);
             }
           }
-          if (ready && arb && !optccArbMay(optccArbSend, args, sub, sub->transmitted)) { ready = 0; sendHeld = true; }
+          if (ready && arb && optccArbSection(sub, true) && !optccArbMay(optccArbSend, args, sub, sub->transmitted)) {
+            ready = 0;
+            sendHeld = true;
+          }
           if (ready) {
             ncclProfilerRecordProxyStepEventState(s, args, transmittedStepId, ncclProfilerProxyStepSendPeerWait_v4);
             // Data is ready, try to send.
@@ -1648,7 +1659,11 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         if (sub->posted < sub->nsteps) {
           if (sub->posted >= sub->done + maxDepth) { subCount = 0; break; }
           // OptCC arbiter: only the connection whose section is due may offer buffers.
-          if (arb && !optccArbMay(optccArbRecv, args, sub, sub->posted)) { subCount = 0; recvHeld = true; break; }
+          if (arb && optccArbSection(sub, false) && !optccArbMay(optccArbRecv, args, sub, sub->posted)) {
+            subCount = 0;
+            recvHeld = true;
+            break;
+          }
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;

@@ -84,6 +84,28 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
 
   // The graph picks a NIC per channel, not per peer, so extra OptCC edges use the ring's NICs.
   NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_OPTCCRING], 0), ret, fail);
+
+  // Bubble filling: the blocks and their sums get a second healthy <-> straggler
+  // connection (connIndex 1), so they have their own buffers, FIFO and QPs and
+  // never queue behind a section. Built here at init with the rest, not lazily.
+  // Passing the graph gives it dedicated buffers of the collective size.
+  if (topology->bfNum > 0) {
+    for (int c=0; c<comm->nChannels; c++) {
+      struct ncclOptccRing* optcc = &comm->channels[c].optccRing;
+      if (!isStraggler) {
+        for (int i=0; i<optcc->nStragglers; i++) {
+          int peer = optcc->stragglerRanks[i];
+          NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &peer, 1, &peer, 1), ret, fail);
+        }
+      } else {
+        for (int r=0; r<comm->nRanks; r++) {
+          if (optccIsStraggler(optcc, r)) continue;
+          NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &r, 1, &r, 1), ret, fail);
+        }
+      }
+    }
+    NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_OPTCCRING], 1), ret, fail);
+  }
   // Unlike the ring, do not reset useGdr/useNetPXN: slots other algorithms already built are skipped above.
   if (ncclParamLocalRegister() || ncclParamGraphRegister()) {  // software config read
     NCCLCHECK(ncclCalloc(&optccInfo, comm->nRanks));
@@ -97,8 +119,8 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
     }
   }
   comm->initAlgoChannels[NCCL_ALGO_OPTCCRING] = true;
-  INFO(NCCL_INIT, "Connected optcc rings, stragglers %d, PXN %d GDR %d",
-       topology->nStragglers, comm->useNetPXN, comm->useGdr);
+  INFO(NCCL_INIT, "Connected optcc rings, stragglers %d, PXN %d GDR %d, filling conns %d",
+       topology->nStragglers, comm->useNetPXN, comm->useGdr, topology->bfNum > 0);
 exit:
   free(optccInfo);
   return ret;
