@@ -199,6 +199,15 @@ struct ncclOptccRing {
   int bfNum, bfDen;
 };
 
+// Bubble-filling block of an OptCC loop, in elements: r = num / den of a full
+// section (one chunk), aligned down to 16 bytes. The loop is nh full sections
+// plus this block; host (calcCollChunking, loop count) and device
+// (all_reduce_optcc_bf.h) size it with this one function so they agree.
+__host__ __device__ inline int64_t ncclOptccBlkCount(int64_t chunkCount, int num, int den, int eltSize) {
+  const int64_t align = 16 / eltSize;
+  return num > 0 ? chunkCount * num / den / align * align : 0;
+}
+
 // The root of each tree only has one node down (+1 intra-node).
 #define NCCL_MAX_TREE_ARITY_TOP 2
 // Nodes inside the binary tree can have to two nodes down (+1 intra-node).

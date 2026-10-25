@@ -2122,8 +2122,9 @@ static ncclResult_t calcCollChunking(
     nstepsPerLoop = 2*(comm->nRanks-1); nchunksPerLoop = comm->nRanks;
     break;
   case ncclPatternOptcc:
-    // One segment = p-1 sections per loop. nsteps counts one section; the
-    // proxy scales it per connection (ncclProxySaveOp).
+    // One segment = p-1 sections per loop (+ the filling block, in loopSize
+    // below). nsteps counts one section; the proxy scales it per connection
+    // (ncclProxySaveOp).
     nstepsPerLoop = 1; nchunksPerLoop = comm->nRanks-1;
     break;
   case ncclPatternNvlsTree:
@@ -2136,6 +2137,11 @@ static ncclResult_t calcCollChunking(
 
   // Compute nSteps for proxies
   size_t loopSize = size_t(nChannels)*nchunksPerLoop*chunkSize;
+  if (pattern == ncclPatternOptcc) {  // + the bubble-filling block of each loop (0 without filling)
+    const struct ncclOptccRing* oc = &comm->channels[0].optccRing;
+    const int eltSize = ncclTypeSize(info->datatype);
+    loopSize += size_t(nChannels) * ncclOptccBlkCount(chunkSize / eltSize, oc->bfNum, oc->bfDen, eltSize) * eltSize;
+  }
   int nLoops = (int)DIVUP(nBytes, loopSize);
   memset(proxyOp, 0, sizeof(*proxyOp));
   proxyOp->nsteps = nstepsPerLoop * nLoops * chunkSteps;

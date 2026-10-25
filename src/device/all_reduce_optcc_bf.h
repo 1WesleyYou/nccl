@@ -16,14 +16,16 @@
  *     into its own (connIndex 1). Block traffic fills the time the straggler
  *     waits for the next loop's sections; a block's sum is needed only then.
  *
- * A loop keeps its size, so the proxy's loop count holds. Its sections shrink
- * to s' = loop / (nh + r) and the block is the rest (r = NUM / DEN, block /
- * section). The last loop of a channel has no block (nothing would return its
- * sum), and loop 0 returns an empty one.
+ * A loop is nh full sections (one chunk each, like OptccRingOrig) plus a
+ * block of r chunks (r = NUM / DEN <= 1, ncclOptccBlkCount; the host's loop
+ * count uses the same size). A short last loop shares out what is left: equal
+ * sections, and a block only past nh full ones. Loop j returns the sum of block
+ * j-1, and a flush after the last loop returns the last one.
  *
  * A primitive call always moves its connections by one chunk, even when empty.
  * Per loop and connection the chunk counts match ncclProxySaveOp's
- * ncclPatternOptcc case:
+ * ncclPatternOptcc case (on connIndex 1 the flush stands in for loop 0's
+ * missing sum):
  *   healthy: 2(nh-1) to next / from prev; 1 to / 1 from the straggler on each
  *            of connIndex 0 and 1;
  *   straggler: 1 to / 1 from each healthy rank on each of connIndex 0 and 1.
@@ -47,32 +49,32 @@ struct OptccRingBf {
     ssize_t gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr, &gridOffset, &channelCount,
                     &chunkCount);
-    const ssize_t loopCount = nh * chunkCount;
+    const ssize_t sec0 = chunkCount;
+    const ssize_t blkMax = ncclOptccBlkCount(chunkCount, oc->bfNum, oc->bfDen, sizeof(T));
+    const ssize_t loopCount = nh * sec0 + blkMax;
     const ssize_t align = 16 / sizeof(T);
+    auto mod = [&] __device__(int j) -> int { return ((j % nh) + nh) % nh; };
     // Block of the previous loop, whose sum this loop returns.
     ssize_t prevOff = gridOffset;
     int prevN = 0;
+    // Straggler: the previous block's sum back to each healthy rank (connIndex 1).
+    auto sendSums = [&] __device__() {
+      for (int i = 0; i < nh; ++i) {  // ordering 2: to the rank that starts section i's chain
+        int h = ordering == 1 ? oc->healthy[i] : oc->healthy[mod(i + 1)];
+        Prims q(tid, nthreads, &none, &h, out, out, work->redOpArg, 0, 0, 1, work);
+        q.sendFromOutput(prevOff, prevN);
+      }
+    };
 
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
-      ssize_t remCount = channelCount - elemOffset;
-      if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nh), align);
-      // Section size and this loop's block. Rounding the section down keeps
-      // nh sections + block inside the loop. A primitive call moves at most
-      // one chunk, so a block that the rounding pushes past a chunk (tiny
-      // chunks only; r <= 1 otherwise keeps it below) turns filling off for
-      // the loop.
-      ssize_t sec = chunkCount;
-      int blkN = 0;
-      if (remCount > loopCount) {
-        sec = (loopCount * oc->bfDen / ((ssize_t)nh * oc->bfDen + oc->bfNum)) / align * align;
-        blkN = (int)(loopCount - (ssize_t)nh * sec);
-        if (blkN > chunkCount) {
-          sec = chunkCount;
-          blkN = 0;
-        }
-      }
+      const ssize_t remCount = channelCount - elemOffset;
+      const bool first = elemOffset == 0;
+      // Full sections and the block; a short last loop shares out what is left
+      // (sections <= a chunk, since chunkCount is a multiple of align).
+      ssize_t sec = sec0;
+      if (remCount < (ssize_t)nh * sec0) sec = alignUp(divUp(remCount, nh), align);
+      const int blkN = (int)max((ssize_t)0, min(blkMax, remCount - (ssize_t)nh * sec));
       const ssize_t blkOff = gridOffset + elemOffset + (ssize_t)nh * sec;
-      auto mod = [&] __device__(int j) -> int { return ((j % nh) + nh) % nh; };
       // Section j of this segment: offset and length (<= 0 on an empty tail;
       // the primitive still runs so every connection advances the same steps).
       auto off = [&] __device__(int j) -> ssize_t { return gridOffset + elemOffset + (ssize_t)mod(j) * sec; };
@@ -121,7 +123,7 @@ struct OptccRingBf {
           Prims blk(tid, nthreads, &none, &S, in, out, work->redOpArg, 0, 0, 1, work);
           blk.send(blkOff, blkN);
         }
-        {  // the previous block's sum
+        if (!first) {  // the previous block's sum
           Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
           link.recv(prevOff, prevN);
         }
@@ -131,27 +133,20 @@ struct OptccRingBf {
         // last loop, back to each healthy rank; then this loop's blocks, which
         // are needed only a loop later, while the straggler waits for the next
         // sections. Sections on connIndex 0, block traffic on connIndex 1.
-        auto sendSums = [&] __device__() {
-          for (int i = 0; i < nh; ++i) {  // ordering 2: to the rank that starts section i's chain
-            int h = ordering == 1 ? oc->healthy[i] : oc->healthy[mod(i + 1)];
-            Prims q(tid, nthreads, &none, &h, out, out, work->redOpArg, 0, 0, 1, work);
-            q.sendFromOutput(prevOff, prevN);
-          }
-        };
         if (ordering == 1) {
           for (int i = 0; i < nh; ++i) {  // S2 + S3: partial of section i in, + our input, result back
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &h, &h, in, out, work->redOpArg, 0, 0, 0, work);
             p.recvReduceCopySend(off(i), off(i), len(i));
           }
-          sendSums();
+          if (!first) sendSums();
         } else {
           for (int i = 0; i < nh; ++i) {  // S3: raw section i to the rank that starts its chain
             int starter = oc->healthy[mod(i + 1)];
             Prims p(tid, nthreads, &none, &starter, in, out, work->redOpArg, 0, 0, 0, work);
             p.send(off(i), len(i));
           }
-          sendSums();
+          if (!first) sendSums();
           for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &h, &none, in, out, work->redOpArg, 0, 0, 0, work);
@@ -168,6 +163,13 @@ struct OptccRingBf {
       }
       prevOff = blkOff;
       prevN = blkN;
+    }
+    // Flush: the last block's sum.
+    if (hi >= 0) {
+      Prims link(tid, nthreads, &S, &none, in, out, work->redOpArg, 0, 1, 0, work);
+      link.recv(prevOff, prevN);
+    } else {
+      sendSums();
     }
   }
 };
