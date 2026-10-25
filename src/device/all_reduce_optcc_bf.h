@@ -11,9 +11,9 @@
  * block never queues in front of a section.
  *   - healthy: section to the straggler (connIndex 0), then its raw block j
  *     (connIndex 1); at the end of the loop, the sum of block j-1 (connIndex 1);
- *   - straggler: all nh section exchanges first (connIndex 0, healthy order),
- *     then the previous loop's nh raw blocks added into its own and their sum
- *     back (connIndex 1). Blocks arrive while the straggler serves sections,
+ *   - straggler: all nh section exchanges first (connIndex 0, healthy order;
+ *     on ordering 2 the raw sections go out a loop ahead), then the previous
+ *     loop's nh raw blocks added into its own and their sum back (connIndex 1). Blocks arrive while the straggler serves sections,
  *     so neither the next loop's sections nor this reduction wait on them.
  *
  * A loop is nh full sections (one chunk each, like OptccRingOrig) plus a
@@ -75,13 +75,31 @@ struct OptccRingBf {
       }
     };
 
+    // Section size of the loop starting at element e (a short last loop shares
+    // out what is left; sections <= a chunk, since chunkCount is a multiple of align).
+    auto secAt = [&] __device__(ssize_t e) -> ssize_t {
+      const ssize_t rem = channelCount - e;
+      return rem < (ssize_t)nh * sec0 ? alignUp(divUp(rem, nh), align) : sec0;
+    };
+    // Straggler, ordering 2: the raw sections of the loop at e to the ranks
+    // that start their chains (S3). They are input data, so they go out a loop
+    // ahead, before this loop's global sums come back.
+    auto sendRaw = [&] __device__(ssize_t e) {
+      const ssize_t sec = secAt(e), rem = channelCount - e;
+      for (int i = 0; i < nh; ++i) {
+        int starter = oc->healthy[mod(i + 1)];
+        Prims p(tid, nthreads, &none, &starter, in, out, work->redOpArg, 0, 0, 0, work);
+        p.send(gridOffset + e + (ssize_t)i * sec, (int)min(sec, rem - (ssize_t)i * sec));
+      }
+    };
+    if (hi < 0 && ordering == 2) sendRaw(0);
+
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
       const ssize_t remCount = channelCount - elemOffset;
       const bool first = elemOffset == 0;
       // Full sections and the block; a short last loop shares out what is left
       // (sections <= a chunk, since chunkCount is a multiple of align).
-      ssize_t sec = sec0;
-      if (remCount < (ssize_t)nh * sec0) sec = alignUp(divUp(remCount, nh), align);
+      const ssize_t sec = secAt(elemOffset);
       const int blkN = (int)max((ssize_t)0, min(blkMax, remCount - (ssize_t)nh * sec));
       const ssize_t blkOff = gridOffset + elemOffset + (ssize_t)nh * sec;
       // Section j of this segment: offset and length (<= 0 on an empty tail;
@@ -148,11 +166,8 @@ struct OptccRingBf {
             p.recvReduceCopySend(off(i), off(i), len(i));
           }
         } else {
-          for (int i = 0; i < nh; ++i) {  // S3: raw section i to the rank that starts its chain
-            int starter = oc->healthy[mod(i + 1)];
-            Prims p(tid, nthreads, &none, &starter, in, out, work->redOpArg, 0, 0, 0, work);
-            p.send(off(i), len(i));
-          }
+          // S3 of the next loop (this loop's went out a loop ago, or before loop 0)
+          if (elemOffset + loopCount < channelCount) sendRaw(elemOffset + loopCount);
           for (int i = 0; i < nh; ++i) {  // S2: global sum of section i from its owner
             int h = oc->healthy[i];
             Prims p(tid, nthreads, &h, &none, in, out, work->redOpArg, 0, 0, 0, work);
