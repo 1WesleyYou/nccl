@@ -213,6 +213,13 @@ NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
 NCCL_PARAM(OptccSerial, "OPTCC_SERIAL", 0);
 NCCL_PARAM(OptccSerialValveMs, "OPTCC_SERIAL_VALVE_MS", 5000);
 NCCL_PARAM(OptccSerialLeadUs, "OPTCC_SERIAL_LEAD_US", -1);
+// Wire-clock hand-over (NCCL_OPTCC_SERIAL_MBPS > 0, send side): the straggler's
+// link rate in Mb/s. The arbiter runs a clock of its own wire, advanced by every
+// section byte it issues (with RoCE framing, 4178 / 4096) at that rate, and lets
+// the next section start LEAD_US (default 0) before that clock says the current
+// one has left the wire, instead of estimating its end from completions (which
+// arrive 0.2-0.9 ms after the last byte, with shaper queueing and the ACK).
+NCCL_PARAM(OptccSerialMbps, "OPTCC_SERIAL_MBPS", 0);
 int64_t ncclParamOptccStraggler();
 int64_t ncclParamOptccBfNum();
 
@@ -237,6 +244,9 @@ struct optccArbiter {
   bool curStarted = false, nextStarted = false;
   std::chrono::steady_clock::time_point curStart, nextStart;
   int64_t secNs = -1;
+  // wire clock (OPTCC_SERIAL_MBPS): when the bytes issued so far have left the link
+  bool wireSet = false;
+  std::chrono::steady_clock::time_point wireFree;
 };
 static optccArbiter optccArbRecv(false), optccArbSend(true);
 
@@ -261,8 +271,8 @@ static bool optccArbOn(struct ncclProxyState* proxyState, struct ncclProxyArgs* 
 static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
   std::lock_guard<std::mutex> lock(a.mu);
   if (!a.announced) {
-    INFO(NCCL_INIT|NCCL_NET, "OptCC serial arbiter on for the straggler's %s (lead %ld us)", a.send ? "sends" : "receives",
-         (long)ncclParamOptccSerialLeadUs());
+    INFO(NCCL_INIT|NCCL_NET, "OptCC serial arbiter on for the straggler's %s (lead %ld us, wire clock %ld Mb/s)",
+         a.send ? "sends" : "receives", (long)ncclParamOptccSerialLeadUs(), (long)ncclParamOptccSerialMbps());
     a.announced = true;
   }
   optccArbOp& op = a.ops[args->opCount];
@@ -366,7 +376,8 @@ static void optccArbAdvance(optccArbiter& a) {
 static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct ncclProxySubArgs* sub, uint64_t step) {
   static const bool lookahead = ncclParamOptccSerial() & 4;
   static const int64_t leadUs = ncclParamOptccSerialLeadUs();
-  const bool timed = a.send && leadUs >= 0;
+  static const bool wireClock = ncclParamOptccSerialMbps() > 0;
+  const bool timed = a.send && (leadUs >= 0 || wireClock);
   std::lock_guard<std::mutex> lock(a.mu);
   if (a.dead) return true;
   optccArbAdvance(a);
@@ -387,8 +398,11 @@ static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct nccl
     uint64_t issued = a.send ? it->second->transmitted : it->second->posted;
     if (issued < std::min<uint64_t>(lo + a.chunkSteps, it->second->nsteps)) return false;
   }
-  if (timed && (!a.curStarted || a.secNs < 0 || now < a.curStart + std::chrono::nanoseconds(a.secNs - leadUs * 1000)))
+  if (timed && wireClock) {
+    if (!a.wireSet || now < a.wireFree - std::chrono::microseconds(std::max<int64_t>(leadUs, 0))) return false;
+  } else if (timed && (!a.curStarted || a.secNs < 0 || now < a.curStart + std::chrono::nanoseconds(a.secNs - leadUs * 1000))) {
     return false;
+  }
   int j = a.j, q = a.q, i = a.i;                 // the section after the current one
   if (++i == (int)a.healthy.size()) { i = 0; if (++q == (int)a.order.size()) { q = 0; j++; } }
   int c = a.order[q], nh = (int)a.healthy.size();
@@ -397,6 +411,17 @@ static bool optccArbMay(optccArbiter& a, struct ncclProxyArgs* args, struct nccl
   bool ok = sub->channelId == c && sub->peer == p && step >= lo2 && step < lo2 + a.chunkSteps;
   if (ok && !a.nextStarted) { a.nextStarted = true; a.nextStart = now; }
   return ok;
+}
+
+// A section step of `bytes` was handed to the NIC: advance the wire clock.
+static void optccArbSent(optccArbiter& a, int bytes) {
+  static const int64_t mbps = ncclParamOptccSerialMbps();
+  if (mbps <= 0) return;
+  std::lock_guard<std::mutex> lock(a.mu);
+  auto now = std::chrono::steady_clock::now();
+  if (!a.wireSet || a.wireFree < now) a.wireFree = now;
+  a.wireSet = true;
+  a.wireFree += std::chrono::nanoseconds((int64_t)bytes * 4178 / 4096 * 8 * 1000 / mbps);
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
@@ -1567,6 +1592,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d, mhandle %p", sub->transmitted, buffSlot, sub->nsteps, sub->requests[buffSlot], buff, size, p, proxyState->tpRank, sub->channelId, sub->sendMhandle);
               sub->transSize = size;
               sub->transmitted += args->sliceSteps;
+              if (arb && optccArbSection(sub, true)) optccArbSent(optccArbSend, size);
               ncclProfilerRecordProxyStepEventState(s, args, transmittedStepId, ncclProfilerProxyStepSendWait);
               args->idle = 0;
               continue;
