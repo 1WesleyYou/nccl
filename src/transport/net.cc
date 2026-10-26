@@ -107,6 +107,7 @@ struct sendNetResources {
   int shared;
   int channelId;
   int connIndex;
+  int simpleBuffSize;
   char* buffers[NCCL_NUM_PROTOCOLS];
   int buffSizes[NCCL_NUM_PROTOCOLS];
   void* mhandles[NCCL_NUM_PROTOCOLS];
@@ -140,6 +141,7 @@ struct recvNetResources {
   int shared;
   int channelId;
   int connIndex;
+  int simpleBuffSize;
   char* buffers[NCCL_NUM_PROTOCOLS];
   int buffSizes[NCCL_NUM_PROTOCOLS];
   void* mhandles[NCCL_NUM_PROTOCOLS];
@@ -179,6 +181,7 @@ struct setupReq {
   int needFlush;
   int channelId;
   int connIndex;
+  int simpleBuffSize;  // SIMPLE buffer if not the comm's (OptCC filling connections)
 };
 
 NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
@@ -237,11 +240,13 @@ struct optccArbiter {
 };
 static optccArbiter optccArbRecv(false), optccArbSend(true);
 
-// Bubble filling moves its blocks on connIndex 1 (ncclTransportOptccConnect); the
-// arbiter orders only the sections, on connIndex 0, and lets the blocks through.
+// The straggler's links: connIndex 0 without filling; with bubble filling every
+// straggler chunk (a section and a block) is on connIndex 1 (ncclTransportOptccConnect,
+// all_reduce_optcc_bf.h), and the arbiter orders those chunks.
 static bool optccArbSection(struct ncclProxySubArgs* sub, bool send) {
+  static const int link = ncclParamOptccBfNum() > 0 ? 1 : 0;
   void* r = sub->connection->transportResources;
-  return (send ? ((struct sendNetResources*)r)->connIndex : ((struct recvNetResources*)r)->connIndex) == 0;
+  return (send ? ((struct sendNetResources*)r)->connIndex : ((struct recvNetResources*)r)->connIndex) == link;
 }
 
 static bool optccArbOn(struct ncclProxyState* proxyState, struct ncclProxyArgs* args, bool send) {
@@ -264,8 +269,8 @@ static void optccArbRegister(optccArbiter& a, struct ncclProxyState* proxyState,
   op.expected = (size_t)args->nChannels * (size_t)(proxyState->tpnRanks - 1);
   for (int s = 0; s < args->nsubs; s++)
     if (optccArbSection(args->subs + s, a.send)) op.subs[{args->subs[s].channelId, args->subs[s].peer}] = args->subs + s;
-  // One flow per (channel, peer) and loop: a section. Bubble-filling blocks run
-  // on their own connection (connIndex 1), outside the arbiter.
+  // One flow per (channel, peer) and loop: a section (with filling, a section
+  // and a block in one chunk; downward a channel ends with 1-2 sum-only chunks).
   a.chunkSteps = args->chunkSteps;
 }
 
@@ -503,6 +508,12 @@ static inline int getHandleForAddressRangeFlags(ncclTopoGdrMode useGdr) {
   return flags;
 }
 
+// The OptCC filling connections (connIndex 1 on the OptccRing graph) carry
+// a section and a block per chunk and get their own SIMPLE buffer size.
+static int optccConnBuffSize(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex) {
+  return connIndex == 1 && graph == &comm->graphs[NCCL_ALGO_OPTCCRING] ? comm->optccBfBuffSize : 0;
+}
+
 /* Determine if we will use this transport for this peer and return connect
  * information for this peer */
 static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, struct ncclPeerInfo* myInfo, struct ncclPeerInfo* peerInfo, struct ncclConnect* connectInfo, struct ncclConnector* send, int channelId, int connIndex) {
@@ -511,6 +522,8 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   send->conn.shared = req.shared = graph || connIndex == 0 ? 0 : ncclParamNetSharedBuffers() != -2 ? ncclParamNetSharedBuffers() : 1;
   req.channelId = channelId;
   req.connIndex = connIndex;
+  req.simpleBuffSize = optccConnBuffSize(comm, graph, connIndex);
+  send->conn.stepSize = req.simpleBuffSize / NCCL_STEPS;  // 0: the comm's, set at connect
 
   int proxyRank;
   int64_t netId;
@@ -553,6 +566,8 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
   recv->conn.shared = req.shared = graph || connIndex == 0 ? 0 : ncclParamNetSharedBuffers() != -2 ? ncclParamNetSharedBuffers() : 1;
   req.channelId = channelId;
   req.connIndex = connIndex;
+  req.simpleBuffSize = optccConnBuffSize(comm, graph, connIndex);
+  recv->conn.stepSize = req.simpleBuffSize / NCCL_STEPS;  // 0: the comm's, set at connect
 
   // Use myInfo->rank as the receiver uses its own NIC
   int proxyRank;
@@ -705,7 +720,7 @@ static ncclResult_t sendConnect(struct ncclComm* comm, struct ncclConnect* conne
 
   struct ncclRecvMem *recvMem = (struct ncclRecvMem*) NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   send->conn.tail = &recvMem->tail;
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  if (send->conn.stepSize == 0) send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
   send->conn.connFifo = recvMem->connFifo;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   for (int i=0; i<NCCL_STEPS; i++) {
@@ -783,7 +798,7 @@ static ncclResult_t recvConnect(struct ncclComm* comm, struct ncclConnect* conne
   struct ncclRecvMem *recvMem = (struct ncclRecvMem*) NCCL_NET_MAP_GET_POINTER(map, gpu, recvMem);
   void* gdcMem = map->mems[NCCL_NET_MAP_GDCMEM].gpuPtr;
   recv->conn.tail = gdcMem ? (uint64_t*)gdcMem : &recvMem->tail;
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  if (recv->conn.stepSize == 0) recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
   recv->conn.connFifo = recvMem->connFifo;
   // Only fuse P2P buffers, continue to allocate dedicated buffers for ring/tree
   for (int i=0; i<NCCL_STEPS; i++) {
@@ -940,6 +955,7 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->useGdr = req->useGdr;
   resources->channelId = req->channelId;
   resources->connIndex = req->connIndex;
+  resources->simpleBuffSize = req->simpleBuffSize;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
   /* DMA-BUF support */
@@ -979,6 +995,7 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->needFlush = req->needFlush;
   resources->channelId = req->channelId;
   resources->connIndex = req->connIndex;
+  resources->simpleBuffSize = req->simpleBuffSize;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
   /* DMA-BUF support */
@@ -1095,8 +1112,9 @@ static ncclResult_t sendProxyConnect(struct ncclProxyConnection* connection, str
 
   if (resources->shared == 0) { // Only allocate dedicated buffers for ring/tree, not for p2p
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-      NCCL_NET_MAP_ADD_POINTER(map, 0, p!= NCCL_PROTO_LL && resources->useGdr ? 1 : 0, proxyState->buffSizes[p], buffs[p]);
-      resources->buffSizes[p] = proxyState->buffSizes[p];
+      int size = p == NCCL_PROTO_SIMPLE && resources->simpleBuffSize ? resources->simpleBuffSize : proxyState->buffSizes[p];
+      NCCL_NET_MAP_ADD_POINTER(map, 0, p!= NCCL_PROTO_LL && resources->useGdr ? 1 : 0, size, buffs[p]);
+      resources->buffSizes[p] = size;
     }
   } else {
     // Get shared buffers
@@ -1262,8 +1280,9 @@ static ncclResult_t recvProxyConnect(struct ncclProxyConnection* connection, str
 
   if (resources->shared == 0) { // Only allocate dedicated buffers for ring/tree, not for p2p
     for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-      NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr ? 1 : 0, proxyState->buffSizes[p], buffs[p]);
-      resources->buffSizes[p] = proxyState->buffSizes[p];
+      int size = p == NCCL_PROTO_SIMPLE && resources->simpleBuffSize ? resources->simpleBuffSize : proxyState->buffSizes[p];
+      NCCL_NET_MAP_ADD_POINTER(map, 0, resources->useGdr ? 1 : 0, size, buffs[p]);
+      resources->buffSizes[p] = size;
     }
   } else {
     // Get shared buffers

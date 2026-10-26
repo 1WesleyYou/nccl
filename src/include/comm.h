@@ -535,6 +535,9 @@ struct ncclComm {
 
   // Buffer sizes
   int buffSizes[NCCL_NUM_PROTOCOLS];
+  // OptCC bubble filling: SIMPLE buffer of the healthy <-> straggler connections
+  // (connIndex 1), which carry a section and a block per chunk (0 = buffSizes).
+  int optccBfBuffSize;
   int p2pChunkSize;
   int nvlsChunkSize;
 

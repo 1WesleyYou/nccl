@@ -13,6 +13,20 @@ enum primsMode {
   primsModePatAg = 2
 };
 
+// One of the two segments of a fused chunk (Primitives::fusedOp, OptCC bubble
+// filling): n elements of user memory, laid out in the chunk after the
+// previous segment. Indices are into the user buffers, like genericOp's.
+//   src / srcBuf: local operand (srcBuf -1 none, 0 input, 1 output);
+//   dst:          where the received data (+ src) goes, in the output (-1 none);
+//   send:         what the segment sends: 0 nothing, 1 the result written to
+//                 dst, 2 the user memory at sendIx / sendBuf (0 input, 1 output).
+struct ncclFusedSeg {
+  int n;
+  intptr_t src; int srcBuf;
+  intptr_t dst;
+  int send; intptr_t sendIx; int sendBuf;
+};
+
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts, bool isNetOffload>
 class Primitives<
@@ -326,7 +340,87 @@ class Primitives<
     }
   }
 
+  // Moves one segment of a fused chunk's slice: elements [lo, hi) of the
+  // chunk, which segment `g` (starting at chunk element `base`) covers.
+  // recvFifo / sendFifo point at the slice's first element in the FIFOs.
+  template <int Recv, int Send>
+  __device__ __forceinline__ void fusedPiece(const ncclFusedSeg& g, int base, int lo, int hi, int sliceLo,
+                                             T* recvFifo, T* sendFifo) {
+    if (lo >= hi) return;
+    const int cnt = hi - lo;
+    T* fifoR = recvFifo + (lo - sliceLo);
+    T* fifoS = sendFifo + (lo - sliceLo);
+    const intptr_t u = lo - base;  // offset inside the segment
+    T* userIn = (T*)ncclShmem.groups[group].userInput;
+    T* userOut = (T*)ncclShmem.groups[group].userOutput;
+    const uint64_t redArg = ncclShmem.redOpArgs[0];
+    uint64_t* preOpArgs = ncclShmem.redOpArgs;
+    if (Recv && g.dst >= 0) {  // received (+ local operand) -> output (and the send FIFO)
+      void* d[2] = {userOut + g.dst + u, fifoS};
+      const int nd = (Send && g.send == 1) ? 2 : 1;
+      if (g.srcBuf < 0) {
+        void* src[1] = {fifoR};
+        reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 2, 0>(tid, nworkers, redArg, preOpArgs, false, 1, src, nd, d, cnt);
+      } else if (g.srcBuf == Input) {  // the input gets the op's pre-op, as in genericOp
+        void* src[2] = {userIn + g.src + u, fifoR};
+        reduceCopy<Unroll, RedOp, T, 0, 2, 2, 0, 1, 2, 1>(tid, nworkers, redArg, preOpArgs, false, 2, src, nd, d, cnt);
+      } else {
+        void* src[2] = {userOut + g.src + u, fifoR};
+        reduceCopy<Unroll, RedOp, T, 0, 2, 2, 0, 1, 2, 0>(tid, nworkers, redArg, preOpArgs, false, 2, src, nd, d, cnt);
+      }
+    }
+    if (Send && g.send == 2) {  // user memory -> the send FIFO
+      void* d[1] = {fifoS};
+      if (g.sendBuf == Input) {
+        void* src[1] = {userIn + g.sendIx + u};
+        reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, 1>(tid, nworkers, redArg, preOpArgs, false, 1, src, 1, d, cnt);
+      } else {
+        void* src[1] = {userOut + g.sendIx + u};
+        reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, 0>(tid, nworkers, redArg, preOpArgs, false, 1, src, 1, d, cnt);
+      }
+    }
+  }
+
 public:
+  // OptCC bubble filling: one chunk made of two segments of user memory, A then
+  // B (ncclFusedSeg), received and/or sent with one primitive call on one
+  // connection, so the two go out back to back as one chunk of slices. The
+  // chunk is cut into SlicePerChunk slices like genericOp's, from the total
+  // A.n + B.n (both ends must use the same total), and a slice may hold the end
+  // of A and the start of B. Recv and Send move the same chunk layout: a
+  // segment that is received and sent (send = 1) or sent from elsewhere
+  // (send = 2) occupies the same chunk elements both ways. Like any primitive
+  // call it moves each connection by one chunk, also when empty. Only the
+  // FIFO path (no direct / registered buffers, no net offload).
+  template <int Recv, int Send>
+  __device__ __forceinline__ void fusedOp(ncclFusedSeg a, ncclFusedSeg b) {
+    a.n = max(a.n, 0);
+    b.n = max(b.n, 0);
+    const int total = a.n + b.n;
+    const int sliceSize = max(divUp(total, 16*SlicePerChunk)*16, 16);
+    int offset = 0;
+    #pragma unroll 1
+    for (int slice = 0; slice < SlicePerChunk; slice++) {
+      const int n = max(0, min(sliceSize, total - offset));
+      if (tid < nworkers) {
+        waitPeer<0, 0, Recv, Send, 1, 1>(0, 0, 0, n);  // FIFOs at srcs[1] (recv), dsts[1] (send)
+        subBarrier();
+        if (n > 0 && !ncclShmem.aborted) {
+          T* recvFifo = Recv ? (T*)ncclShmem.groups[group].srcs[1] : nullptr;
+          T* sendFifo = Send ? (T*)ncclShmem.groups[group].dsts[1] : nullptr;
+          fusedPiece<Recv, Send>(a, 0, max(offset, 0), min(offset + n, a.n), offset, recvFifo, sendFifo);
+          fusedPiece<Recv, Send>(b, a.n, max(offset, a.n), min(offset + n, total), offset, recvFifo, sendFifo);
+        }
+      }
+      barrier();
+      postPeer<Recv, Send>(n > 0);
+      offset += n;
+    }
+  }
+  __device__ __forceinline__ void fusedSend(ncclFusedSeg a, ncclFusedSeg b) { fusedOp<0, 1>(a, b); }
+  __device__ __forceinline__ void fusedRecv(ncclFusedSeg a, ncclFusedSeg b) { fusedOp<1, 0>(a, b); }
+  __device__ __forceinline__ void fusedRecvSend(ncclFusedSeg a, ncclFusedSeg b) { fusedOp<1, 1>(a, b); }
+
   static inline __device__ void sendPeerNotify(int peer, int connIndex, int steps) {
     ncclDevChannelPeer* peerPtr = ncclShmem.channel.peers[peer];
     peerPtr->send[connIndex].step += steps;

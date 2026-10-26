@@ -90,6 +90,11 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
   // never queue behind a section. Built here at init with the rest, not lazily.
   // Passing the graph gives it dedicated buffers of the collective size.
   if (topology->bfNum > 0) {
+    // A chunk on these connections is a section s plus a block t = s * NUM / DEN
+    // (all_reduce_optcc_bf.h), so their buffer is the ring's scaled by
+    // 1 + NUM / DEN, with room for the slices' 16-element rounding.
+    const int64_t ring = comm->buffSizes[NCCL_PROTO_SIMPLE];
+    comm->optccBfBuffSize = (int)alignUp(ring + ring * topology->bfNum / topology->bfDen + 4096, (int64_t)4096);
     for (int c=0; c<comm->nChannels; c++) {
       struct ncclOptccRing* optcc = &comm->channels[c].optccRing;
       if (!isStraggler) {
@@ -105,6 +110,22 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
       }
     }
     NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_OPTCCRING], 1), ret, fail);
+    // Only the NET transport sizes these buffers per connection (net.cc); a
+    // P2P / SHM peer would get the comm's smaller buffer and overflow it.
+    for (int c=0; c<comm->nChannels; c++) {
+      for (int r=0; r<comm->nRanks; r++) {
+        struct ncclChannelPeer* peer = comm->channels[c].peers[r];
+        if (r == comm->rank || peer == NULL) continue;
+        for (struct ncclConnector* conn : {peer->send + 1, peer->recv + 1}) {
+          if (conn->connected && conn->conn.stepSize != comm->optccBfBuffSize / NCCL_STEPS) {
+            WARN("OptCC bubble filling: channel %d peer %d connIndex 1 has step size %d, not %d; filling needs the NET transport between healthy ranks and the straggler",
+                 c, r, conn->conn.stepSize, comm->optccBfBuffSize / NCCL_STEPS);
+            ret = ncclInvalidUsage;
+            goto fail;
+          }
+        }
+      }
+    }
   }
   // Unlike the ring, do not reset useGdr/useNetPXN: slots other algorithms already built are skipped above.
   if (ncclParamLocalRegister() || ncclParamGraphRegister()) {  // software config read
@@ -119,8 +140,8 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
     }
   }
   comm->initAlgoChannels[NCCL_ALGO_OPTCCRING] = true;
-  INFO(NCCL_INIT, "Connected optcc rings, stragglers %d, PXN %d GDR %d, filling conns %d",
-       topology->nStragglers, comm->useNetPXN, comm->useGdr, topology->bfNum > 0);
+  INFO(NCCL_INIT, "Connected optcc rings, stragglers %d, PXN %d GDR %d, filling conns %d (buffer %d)",
+       topology->nStragglers, comm->useNetPXN, comm->useGdr, topology->bfNum > 0, comm->optccBfBuffSize);
 exit:
   free(optccInfo);
   return ret;

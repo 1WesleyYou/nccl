@@ -608,28 +608,39 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       struct ncclOptccRing* oc = &channel->optccRing;
       struct ncclProxyOp ringOp = *op;
       ringOp.nsteps = op->nsteps * 2 * (oc->nHealthyRanks - 1);
-      // Straggler link (connIndex 0): one section each way per segment. Bubble
-      // filling adds, on connIndex 1, one chunk each way per segment: the raw
-      // block up and the previous block's sum back (all_reduce_optcc_bf.h).
       struct ncclProxyOp linkOp = *op;
-      const bool bf = oc->bfNum > 0;
+      if (oc->bfNum == 0) {  // straggler links on connIndex 0, one section each way per segment
+        if (oc->healthyIndex >= 0) {
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->ringPrev, &ringOp, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->ringNext, &ringOp, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, &linkOp, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, &linkOp, 0, justInquire));
+        } else {
+          for (int i=0; i<oc->nHealthyRanks; i++) {
+            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], &linkOp, 0, justInquire));
+            NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], &linkOp, 0, justInquire));
+          }
+        }
+        break;
+      }
+      // Bubble filling (all_reduce_optcc_bf.h): every straggler link is on
+      // connIndex 1, one chunk (section + block) per segment upward; downward
+      // also the trailing block sums, 1 chunk (ordering 1, even channels) or 2
+      // (ordering 2, odd channels).
+      struct ncclProxyOp upOp = *op, downOp = *op;
+      downOp.nsteps = op->nsteps + op->chunkSteps * (channel->id % 2 == 0 ? 1 : 2);
+      // A slice on these connections is up to a section plus a block: the
+      // receive size the proxy posts (op->nbytes, the ring's slice) is theirs.
+      upOp.nbytes = downOp.nbytes = (ssize_t)comm->optccBfBuffSize / NCCL_STEPS * op->sliceSteps;
       if (oc->healthyIndex >= 0) {
         NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->ringPrev, &ringOp, 0, justInquire));
         NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->ringNext, &ringOp, 0, justInquire));
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, &linkOp, 0, justInquire));
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, &linkOp, 0, justInquire));
-        if (bf) {
-          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, &linkOp, 1, justInquire));
-          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, &linkOp, 1, justInquire));
-        }
+        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->straggler, &downOp, 1, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->straggler, &upOp, 1, justInquire));
       } else {
         for (int i=0; i<oc->nHealthyRanks; i++) {
-          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], &linkOp, 0, justInquire));
-          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], &linkOp, 0, justInquire));
-          if (bf) {
-            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], &linkOp, 1, justInquire));
-            NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], &linkOp, 1, justInquire));
-          }
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, oc->healthy[i], &upOp, 1, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, oc->healthy[i], &downOp, 1, justInquire));
         }
       }
     } break;
