@@ -113,9 +113,9 @@ ncclResult_t ncclTransportOptccConnect(struct ncclComm* comm) {
     // Only the NET transport sizes these buffers per connection (net.cc); a
     // P2P / SHM peer would get the comm's smaller buffer and overflow it.
     for (int c=0; c<comm->nChannels; c++) {
-      for (int r=0; r<comm->nRanks; r++) {
+      for (int r=0; r<comm->nRanks; r++) {  // only this rank's healthy <-> straggler links
         struct ncclChannelPeer* peer = comm->channels[c].peers[r];
-        if (r == comm->rank || peer == NULL) continue;
+        if (r == comm->rank || peer == NULL || isStraggler == optccIsStraggler(topology, r)) continue;
         for (struct ncclConnector* conn : {peer->send + 1, peer->recv + 1}) {
           if (conn->connected && conn->conn.stepSize != comm->optccBfBuffSize / NCCL_STEPS) {
             WARN("OptCC bubble filling: channel %d peer %d connIndex 1 has step size %d, not %d; filling needs the NET transport between healthy ranks and the straggler",
